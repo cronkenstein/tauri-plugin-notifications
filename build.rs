@@ -84,6 +84,8 @@ fn main() {
             }
 
             println!("cargo:rerun-if-changed=macos/Sources/NotificationPlugin.swift");
+            println!("cargo:rerun-if-env-changed=TARGET");
+            println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
             swift_bridge_build::parse_bridges(bridges)
                 .write_all_concatenated(swift_bridge_out_dir(), env!("CARGO_PKG_NAME"));
@@ -107,7 +109,14 @@ fn compile_swift() {
 
     let mut cmd = Command::new("swift");
 
-    cmd.current_dir(swift_package_dir).arg("build").args([
+    cmd.current_dir(swift_package_dir).arg("build");
+
+    // Match Cargo's target arch so Intel / universal cross-builds link correctly.
+    for arch in swift_arches() {
+        cmd.args(["--arch", arch]);
+    }
+
+    cmd.args([
         "-Xswiftc",
         "-import-objc-header",
         "-Xswiftc",
@@ -136,6 +145,33 @@ Stdout: {}
             String::from_utf8(exit_status.stderr).expect("Stderr must be valid UTF-8"),
             String::from_utf8(exit_status.stdout).expect("Stdout must be valid UTF-8"),
         )
+    }
+}
+
+/// Swift `--arch` values for the current Cargo TARGET.
+#[cfg(target_os = "macos")]
+fn swift_arches() -> Vec<&'static str> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.starts_with("x86_64-") {
+        vec!["x86_64"]
+    } else if target.starts_with("aarch64-") || target.starts_with("arm64-") {
+        vec!["arm64"]
+    } else {
+        // Host default (no --arch).
+        Vec::new()
+    }
+}
+
+/// SPM places arch-specific products under `.build/<triple>/{debug,release}`.
+#[cfg(target_os = "macos")]
+fn swift_target_triple() -> Option<&'static str> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.starts_with("x86_64-") {
+        Some("x86_64-apple-macosx")
+    } else if target.starts_with("aarch64-") || target.starts_with("arm64-") {
+        Some("arm64-apple-macosx")
+    } else {
+        None
     }
 }
 
@@ -173,5 +209,9 @@ fn swift_library_static_lib_dir() -> PathBuf {
         "debug"
     };
 
-    manifest_dir().join(format!("macos/.build/{debug_or_release}"))
+    if let Some(triple) = swift_target_triple() {
+        manifest_dir().join(format!("macos/.build/{triple}/{debug_or_release}"))
+    } else {
+        manifest_dir().join(format!("macos/.build/{debug_or_release}"))
+    }
 }
