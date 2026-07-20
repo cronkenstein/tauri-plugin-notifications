@@ -1,10 +1,14 @@
 use serde::de::DeserializeOwned;
 use tauri::{
     plugin::{PermissionState, PluginApi},
-    AppHandle, Runtime,
+    AppHandle, Manager, Runtime,
 };
 
 use crate::NotificationsBuilder;
+
+#[cfg(windows)]
+#[path = "windows_toast.rs"]
+mod windows_toast;
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
@@ -20,25 +24,42 @@ pub struct Notifications<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> crate::NotificationsBuilder<R> {
     pub async fn show(self) -> crate::Result<()> {
-        let mut notification = imp::Notification::new(self.app.config().identifier.clone());
-
-        if let Some(title) = self
-            .data
-            .title
-            .or_else(|| self.app.config().product_name.clone())
+        #[cfg(windows)]
         {
-            notification = notification.title(title);
-        }
-        if let Some(body) = self.data.body {
-            notification = notification.body(body);
-        }
-        if let Some(icon) = self.data.icon {
-            notification = notification.icon(icon);
+            return windows_toast::show(
+                &self.app,
+                self.app.config().identifier.clone(),
+                self.data.id,
+                self.data.title.or_else(|| self.app.config().product_name.clone()),
+                self.data.body,
+                self.data.icon,
+                self.data.extra,
+                self.data.silent,
+            );
         }
 
-        notification.show()?;
+        #[cfg(not(windows))]
+        {
+            let mut notification = imp::Notification::new(self.app.config().identifier.clone());
 
-        Ok(())
+            if let Some(title) = self
+                .data
+                .title
+                .or_else(|| self.app.config().product_name.clone())
+            {
+                notification = notification.title(title);
+            }
+            if let Some(body) = self.data.body {
+                notification = notification.body(body);
+            }
+            if let Some(icon) = self.data.icon {
+                notification = notification.icon(icon);
+            }
+
+            notification.show()?;
+
+            Ok(())
+        }
     }
 }
 
@@ -109,10 +130,19 @@ impl<R: Runtime> Notifications<R> {
         )))
     }
 
-    pub fn set_click_listener_active(&self, _active: bool) -> crate::Result<()> {
-        Err(crate::Error::Io(std::io::Error::other(
-            "Click listeners are not supported with notify-rust",
-        )))
+    pub fn set_click_listener_active(&self, active: bool) -> crate::Result<()> {
+        #[cfg(windows)]
+        {
+            windows_toast::set_click_listener_active(active);
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = active;
+            Err(crate::Error::Io(std::io::Error::other(
+                "Click listeners are not supported with notify-rust",
+            )))
+        }
     }
 
     pub fn remove_active(&self, _ids: Vec<i32>) -> crate::Result<()> {
@@ -158,11 +188,18 @@ impl<R: Runtime> Notifications<R> {
     }
 }
 
-mod imp {
-    //! Types and functions related to desktop notifications.
+/// Bring the main window forward after a notification click.
+pub(crate) fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
 
-    #[cfg(windows)]
-    use std::path::MAIN_SEPARATOR as SEP;
+#[cfg(not(windows))]
+mod imp {
+    //! Types and functions related to desktop notifications (notify-rust path).
 
     /// The desktop notification definition.
     ///
@@ -223,18 +260,6 @@ mod imp {
                 notification.icon(&icon);
             } else {
                 notification.auto_icon();
-            }
-            #[cfg(windows)]
-            {
-                let exe = tauri::utils::platform::current_exe()?;
-                let exe_dir = exe.parent().expect("failed to get exe directory");
-                let curr_dir = exe_dir.display().to_string();
-                // set the notification's System.AppUserModel.ID only when running the installed app
-                if !(curr_dir.ends_with(format!("{SEP}target{SEP}debug").as_str())
-                    || curr_dir.ends_with(format!("{SEP}target{SEP}release").as_str()))
-                {
-                    notification.app_id(&self.identifier);
-                }
             }
             #[cfg(target_os = "macos")]
             {

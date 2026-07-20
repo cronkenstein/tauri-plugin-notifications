@@ -36,6 +36,9 @@ swift-bridge = { version = "0.1", features = ["async"] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 notify-rust = { version = "4.11", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
+
 [build-dependencies]
 tauri-plugin = { version = "2.4.0", features = ["build"] }
 
