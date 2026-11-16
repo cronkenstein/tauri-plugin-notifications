@@ -41,6 +41,7 @@ const val REMOTE_INPUT_KEY = "NotificationRemoteInput"
 const val DEFAULT_NOTIFICATION_CHANNEL_ID = "default"
 const val DEFAULT_PRESS_ACTION = "tap"
 const val TAG = "NotificationsPlugin"
+const val SELF_PERSON_NAME = "You"
 
 class TauriNotificationManager(
   private val storage: NotificationStorage,
@@ -102,7 +103,7 @@ class TauriNotificationManager(
       channel.description = description
       val audioAttributes = AudioAttributes.Builder()
         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-        .setUsage(AudioAttributes.USAGE_ALARM)
+        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
         .build()
       val soundUri = getDefaultSoundUrl(context)
       if (soundUri != null) {
@@ -284,7 +285,7 @@ class TauriNotificationManager(
       mBuilder.setCategory(category)
     }
 
-    // Style selection (mutually exclusive: messagingStyle > largeBody > inboxLines)
+    // Style selection (mutually exclusive: messagingStyle > messages > largeBody > inboxLines)
     if (notification.messagingStyle != null) {
       val msgStyle = notification.messagingStyle!!
       // Pre-fetch all avatar images in parallel (max ~10s total, not N×10s)
@@ -302,6 +303,11 @@ class TauriNotificationManager(
         messagingStyle.addMessage(msg.text, msg.timestamp, senderPerson)
       }
       mBuilder.setStyle(messagingStyle)
+    } else if (!notification.messages.isNullOrEmpty()) {
+      val messages = notification.messages!!
+      val style = buildMessagingStyle(notification, messages)
+      mBuilder.setStyle(style)
+      style.messages.lastOrNull()?.let { mBuilder.setWhen(it.timestamp) }
     } else if (notification.largeBody != null) {
       // support multiline text
       mBuilder.setStyle(
@@ -318,19 +324,23 @@ class TauriNotificationManager(
       inboxStyle.setSummaryText(notification.summary)
       mBuilder.setStyle(inboxStyle)
     }
-    val sound = notification.getSound(context, getDefaultSound(context))
-    if (sound != null) {
-      val soundUri = Uri.parse(sound)
-      // Grant permission to use sound
-      context.grantUriPermission(
-        "com.android.systemui",
-        soundUri,
-        Intent.FLAG_GRANT_READ_URI_PERMISSION
-      )
-      mBuilder.setSound(soundUri)
-      mBuilder.setDefaults(android.app.Notification.DEFAULT_VIBRATE or android.app.Notification.DEFAULT_LIGHTS)
+    if (notification.silent == true) {
+      mBuilder.setSilent(true)
     } else {
-      mBuilder.setDefaults(android.app.Notification.DEFAULT_ALL)
+      val sound = notification.getSound(context, getDefaultSound(context))
+      if (sound != null) {
+        val soundUri = Uri.parse(sound)
+        // Grant permission to use sound
+        context.grantUriPermission(
+          "com.android.systemui",
+          soundUri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+        mBuilder.setSound(soundUri)
+        mBuilder.setDefaults(android.app.Notification.DEFAULT_VIBRATE or android.app.Notification.DEFAULT_LIGHTS)
+      } else {
+        mBuilder.setDefaults(android.app.Notification.DEFAULT_ALL)
+      }
     }
     val group = notification.group
     if (group != null) {
@@ -340,7 +350,7 @@ class TauriNotificationManager(
       }
     }
     mBuilder.setVisibility(notification.visibility ?: NotificationCompat.VISIBILITY_PRIVATE)
-    mBuilder.setOnlyAlertOnce(true)
+    mBuilder.setOnlyAlertOnce(notification.onlyAlertOnce ?: true)
     mBuilder.setSmallIcon(notification.getSmallIcon(context, getDefaultSmallIcon(context)))
     mBuilder.setLargeIcon(notification.getLargeIcon(context))
     val iconColor = notification.getIconColor(config?.iconColor ?: "")
@@ -352,7 +362,6 @@ class TauriNotificationManager(
       }
     }
     createActionIntents(notification, mBuilder)
-    // notificationId is a unique int for each notification that you must define
     val buildNotification = mBuilder.build()
     if (notification.schedule != null) {
       triggerScheduledNotification(buildNotification, notification)
@@ -366,6 +375,28 @@ class TauriNotificationManager(
     }
   }
 
+  /** Renders a conversation as MessagingStyle, the style Android expects for chat. */
+  private fun buildMessagingStyle(
+    notification: Notification,
+    messages: List<NotificationMessage>
+  ): NotificationCompat.MessagingStyle {
+    val style = NotificationCompat.MessagingStyle(
+      Person.Builder().setName(SELF_PERSON_NAME).build()
+    )
+    style.isGroupConversation = notification.isGroupConversation
+    // In a one-to-one chat the sender name is already the title Android shows.
+    if (notification.isGroupConversation) {
+      style.conversationTitle = notification.title
+    }
+    for (message in messages) {
+      val sender = message.senderName?.let { name ->
+        Person.Builder().setName(name).setKey(message.senderKey).build()
+      }
+      style.addMessage(NotificationCompat.MessagingStyle.Message(message.body, message.timestamp, sender))
+    }
+    return style
+  }
+
   // Create intents for open/dismiss actions
   private fun createActionIntents(
     notification: Notification,
@@ -373,10 +404,7 @@ class TauriNotificationManager(
   ) {
     // Open intent
     val intent = buildIntent(notification, DEFAULT_PRESS_ACTION)
-    var flags = PendingIntent.FLAG_CANCEL_CURRENT
-    if (SDK_INT >= Build.VERSION_CODES.S) {
-      flags = flags or PendingIntent.FLAG_MUTABLE
-    }
+    val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     val pendingIntent = PendingIntent.getActivity(context, notification.id, intent, flags)
     mBuilder.setContentIntent(pendingIntent)
 
@@ -385,28 +413,36 @@ class TauriNotificationManager(
     if (actionTypeId != null) {
       val actionGroup = storage.getActionGroup(actionTypeId)
       for (notificationAction in actionGroup) {
+        val action = notificationAction ?: continue
         // Resolve custom action icon, fall back to transparent
-        val actionIconResId = if (notificationAction!!.icon != null) {
-          val resId = AssetUtils.getResourceID(context, notificationAction.icon, "drawable")
+        val actionIconResId = if (action.icon != null) {
+          val resId = AssetUtils.getResourceID(context, action.icon, "drawable")
           if (resId != AssetUtils.RESOURCE_ID_ZERO_VALUE) resId else R.drawable.ic_transparent
         } else {
           R.drawable.ic_transparent
         }
-        val actionIntent = buildIntent(notification, notificationAction.id)
-        val actionPendingIntent = PendingIntent.getActivity(
-          context,
-          (notification.id) + notificationAction.id.hashCode(),
-          actionIntent,
-          flags
-        )
+        val actionIntent = buildIntent(notification, action.id)
+        var actionFlags = flags
+        if (action.input == true) {
+          actionFlags = PendingIntent.FLAG_UPDATE_CURRENT
+          if (SDK_INT >= Build.VERSION_CODES.S) {
+            actionFlags = actionFlags or PendingIntent.FLAG_MUTABLE
+          }
+        }
+        val actionRequestCode = (notification.id) + action.id.hashCode()
+        val actionPendingIntent = if (BackgroundActions.runsInBackground(action)) {
+          BackgroundActions.pendingIntent(context, actionIntent, actionRequestCode, actionFlags)
+        } else {
+          PendingIntent.getActivity(context, actionRequestCode, actionIntent, actionFlags)
+        }
         val actionBuilder: NotificationCompat.Action.Builder = NotificationCompat.Action.Builder(
           actionIconResId,
-          notificationAction.title,
+          action.title,
           actionPendingIntent
         )
-        if (notificationAction.input == true) {
+        if (action.input == true) {
           val remoteInput = RemoteInput.Builder(REMOTE_INPUT_KEY).setLabel(
-            notificationAction.title
+            action.title
           ).build()
           actionBuilder.addRemoteInput(remoteInput)
         }
@@ -427,12 +463,8 @@ class TauriNotificationManager(
       NOTIFICATION_IS_REMOVABLE_KEY,
       schedule == null || schedule.isRemovable()
     )
-    flags = 0
-    if (SDK_INT >= Build.VERSION_CODES.S) {
-      flags = PendingIntent.FLAG_MUTABLE
-    }
     val deleteIntent =
-      PendingIntent.getBroadcast(context, notification.id, dissmissIntent, flags)
+      PendingIntent.getBroadcast(context, notification.id, dissmissIntent, PendingIntent.FLAG_IMMUTABLE)
     mBuilder.setDeleteIntent(deleteIntent)
   }
 
@@ -441,7 +473,8 @@ class TauriNotificationManager(
       Intent(context, activity.javaClass)
     } else {
       val packageName = context.packageName
-      context.packageManager.getLaunchIntentForPackage(packageName)!!
+      context.packageManager.getLaunchIntentForPackage(packageName)
+        ?: Intent(Intent.ACTION_MAIN).setPackage(packageName)
     }
     intent.action = Intent.ACTION_MAIN
     intent.addCategory(Intent.CATEGORY_LAUNCHER)
@@ -451,6 +484,9 @@ class TauriNotificationManager(
     intent.putExtra(NOTIFICATION_OBJ_INTENT_KEY, notification.sourceJson)
     val schedule = notification.schedule
     intent.putExtra(NOTIFICATION_IS_REMOVABLE_KEY, schedule == null || schedule.isRemovable())
+    // PendingIntent identity ignores extras; the identifier keeps request-code collisions
+    // from overwriting another notification's action payload.
+    if (SDK_INT >= Build.VERSION_CODES.Q) intent.identifier = "${notification.id}/${action.orEmpty()}"
     return intent
   }
 
@@ -466,10 +502,7 @@ class TauriNotificationManager(
     )
     notificationIntent.putExtra(NOTIFICATION_INTENT_KEY, request.id)
     notificationIntent.putExtra(TimedNotificationPublisher.NOTIFICATION_KEY, notification)
-    var flags = PendingIntent.FLAG_CANCEL_CURRENT
-    if (SDK_INT >= Build.VERSION_CODES.S) {
-      flags = flags or PendingIntent.FLAG_MUTABLE
-    }
+    val flags = PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
     var pendingIntent =
       PendingIntent.getBroadcast(context, request.id, notificationIntent, flags)
 
@@ -479,13 +512,14 @@ class TauriNotificationManager(
 
     when (schedule) {
       is NotificationSchedule.At -> {
-        if (schedule.date.time < Date().time) {
+        if (!schedule.repeating && schedule.date.time < Date().time) {
           Logger.error(Logger.tags(TAG), "Scheduled time must be *after* current time", null)
           return
         }
         if (schedule.repeating) {
-          val interval: Long = schedule.date.time - Date().time
-          alarmManager.setRepeating(rtcMode, schedule.date.time, interval, pendingIntent)
+          notificationIntent.putExtra(TimedNotificationPublisher.DAILY_FROM_KEY, schedule.date.time)
+          pendingIntent = PendingIntent.getBroadcast(context, request.id, notificationIntent, flags)
+          setExactIfPossible(alarmManager, schedule, nextDailyTrigger(schedule.date.time, Date().time), pendingIntent)
         } else {
           setExactIfPossible(alarmManager, schedule, schedule.date.time, pendingIntent, rtcMode)
         }
@@ -548,10 +582,7 @@ class TauriNotificationManager(
 
   private fun cancelTimerForNotification(notificationId: Int) {
     val intent = Intent(context, TimedNotificationPublisher::class.java)
-    var flags = 0
-    if (SDK_INT >= Build.VERSION_CODES.S) {
-      flags = PendingIntent.FLAG_MUTABLE
-    }
+    val flags = PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
     val pi = PendingIntent.getBroadcast(context, notificationId, intent, flags)
     if (pi != null) {
       val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -621,8 +652,15 @@ class NotificationDismissReceiver : BroadcastReceiver() {
       val notificationStorage = NotificationStorage(context, ObjectMapper())
       notificationStorage.deleteNotification(intExtra.toString())
     }
+    NotificationPlugin.instance?.onNotificationDismissed(intExtra)
   }
 }
+
+private const val DAY_MS = 24L * 60 * 60 * 1000
+
+/** First `from + k days` strictly after `now` (or `from` itself while it is still ahead). */
+internal fun nextDailyTrigger(from: Long, now: Long): Long =
+  if (from > now) from else from + ((now - from) / DAY_MS + 1) * DAY_MS
 
 class TimedNotificationPublisher : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
@@ -671,15 +709,16 @@ class TimedNotificationPublisher : BroadcastReceiver() {
   @SuppressLint("MissingPermission", "SimpleDateFormat")
   private fun rescheduleNotificationIfNeeded(context: Context, intent: Intent, id: Int): Boolean {
     val dateString = intent.getStringExtra(CRON_KEY)
-    if (dateString != null) {
-      val date = DateMatch.fromMatchString(dateString)
+    val dailyFrom = intent.getLongExtra(DAILY_FROM_KEY, Long.MIN_VALUE)
+    if (dateString != null || dailyFrom != Long.MIN_VALUE) {
       val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-      val trigger = date.nextTrigger(Date())
-      val clone = intent.clone() as Intent
-      var flags = PendingIntent.FLAG_CANCEL_CURRENT
-      if (SDK_INT >= Build.VERSION_CODES.S) {
-        flags = flags or PendingIntent.FLAG_MUTABLE
+      val trigger = if (dateString != null) {
+        DateMatch.fromMatchString(dateString).nextTrigger(Date())
+      } else {
+        nextDailyTrigger(dailyFrom, System.currentTimeMillis())
       }
+      val clone = intent.clone() as Intent
+      val flags = PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
       val pendingIntent = PendingIntent.getBroadcast(context, id, clone, flags)
       if (SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
         alarmManager[AlarmManager.RTC, trigger] = pendingIntent
@@ -699,6 +738,7 @@ class TimedNotificationPublisher : BroadcastReceiver() {
   companion object {
     var NOTIFICATION_KEY = "NotificationPublisher.notification"
     var CRON_KEY = "NotificationPublisher.cron"
+    const val DAILY_FROM_KEY = "NotificationPublisher.dailyFrom"
   }
 }
 
@@ -718,7 +758,7 @@ class LocalNotificationRestoreReceiver : BroadcastReceiver() {
     for (id in ids) {
       val notification = storage.getSavedNotification(id) ?: continue
       val schedule = notification.schedule
-      if (schedule != null && schedule is NotificationSchedule.At) {
+      if (schedule is NotificationSchedule.At && !schedule.repeating) {
         val at: Date = schedule.date
         if (at.before(Date())) {
           // modify the scheduled date in order to show notifications that would have been delivered while device was off.

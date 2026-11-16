@@ -77,6 +77,17 @@ interface Options {
    */
   inboxLines?: string[];
   /**
+   * Conversation messages, newest last.
+   * Changes the notification style to messaging on Android.
+   * Takes precedence over `largeBody` and `inboxLines`.
+   */
+  messages?: NotificationMessage[];
+  /**
+   * Marks a `messages` conversation as having more than two participants, so
+   * Android shows the conversation title alongside each sender.
+   */
+  groupConversation?: boolean;
+  /**
    * Notification icon.
    *
    * On Android the icon must be placed in the app's `res/drawable` folder.
@@ -114,6 +125,7 @@ interface Options {
   autoCancel?: boolean;
   /**
    * Changes the notification presentation to be silent on iOS (no badge, no sound, not listed).
+   * On Android it suppresses sound and vibration for this post.
    */
   silent?: boolean;
   /**
@@ -347,6 +359,24 @@ class Schedule {
 }
 
 /**
+ * One message of a conversation notification.
+ */
+interface NotificationMessage {
+  /** Stable event ID for merging warm and push deliveries on Android. */
+  eventId?: string;
+  /** Whether the preview came from an encrypted message. Defaults to false. */
+  encrypted?: boolean;
+  /** The message text. */
+  body: string;
+  /** When the message was sent, in milliseconds since the epoch. */
+  timestamp: number;
+  /** Sender display name. Omit for messages sent by the device owner. */
+  senderName?: string;
+  /** Stable sender identifier, so Android can recognise the same person again. */
+  senderKey?: string;
+}
+
+/**
  * Attachment of a notification.
  */
 interface Attachment {
@@ -448,6 +478,27 @@ interface ActiveNotification {
   sound?: string;
 }
 
+/** Data received when an action is performed on a notification. */
+interface ActionPerformedData {
+  /** Identifier of the selected action, or `tap`/`dismiss` for system actions. */
+  actionId: string;
+  /** Text entered for an action with `input: true`. */
+  inputValue?: string;
+  /** The notification, including its action type and extra metadata. */
+  notification: ActionNotification;
+}
+
+/** Notification data included with an action result. Platform-specific fields are optional. */
+interface ActionNotification {
+  /** Numeric local notification ID, or -1 when a provider notification has no numeric ID. */
+  id: number;
+  title?: string;
+  body?: string;
+  actionTypeId?: string;
+  extra?: Record<string, unknown>;
+  source?: "local" | "push";
+}
+
 /**
  * The importance level of a notification channel (Android).
  */
@@ -530,27 +581,52 @@ async function requestPermission(): Promise<NotificationPermission> {
   return await invoke("plugin:notifications|request_permission");
 }
 
+interface PushRegistration {
+  deviceToken: string;
+  p256dh?: string;
+  auth?: string;
+  instance?: string;
+}
+
+type PushProvider = "auto" | "fcm" | "unifiedpush" | "embedded";
+
 /**
- * Registers the app for push notifications (mobile).
+ * Registers the app for push notifications.
  *
- * @example
- * ```typescript
- * import { registerForPushNotifications } from '@choochmeque/tauri-plugin-notifications-api';
- * const token = await registerForPushNotifications();
- * console.log('Push token:', token);
- * ```
+ * `deviceToken` is the APNs token on iOS and macOS, the UnifiedPush endpoint URL on
+ * Android and Linux, and the WNS channel URI on Windows. On Android, pass a base64url
+ * VAPID public key to register against a Web Push distributor; `p256dh` and `auth`
+ * are then set on the result. Other platforms ignore `vapid`.
  *
- * @returns A promise resolving to the device push token.
+ * `embeddedGatewayUrl` enables the in-app distributor on Android, used when neither FCM
+ * nor an installed distributor can deliver.
+ *
+ * `userId` and `deviceId` select the account's Android push subscription.
+ *
+ * @returns A promise resolving to the {@link PushRegistration}.
  */
-async function registerForPushNotifications(): Promise<string> {
-  return await invoke("plugin:notifications|register_for_push_notifications");
+async function registerForPushNotifications(
+  vapid?: string,
+  provider: PushProvider = "auto",
+  embeddedGatewayUrl?: string,
+  userId?: string,
+  deviceId?: string,
+): Promise<PushRegistration> {
+  return await invoke("plugin:notifications|register_for_push_notifications", {
+    vapid,
+    provider,
+    embeddedGatewayUrl,
+    userId,
+    deviceId,
+  });
 }
 
 /**
- * Unregisters the app from push notifications (mobile).
+ * Unregisters the app from push notifications.
  *
- * This removes the device's push notification token and stops receiving
- * remote push notifications.
+ * This removes the device's push notification registration and stops
+ * receiving remote pushes. On Linux it calls `Unregister` on the active
+ * UnifiedPush distributor.
  *
  * @example
  * ```typescript
@@ -562,7 +638,107 @@ async function registerForPushNotifications(): Promise<string> {
  * @returns A promise resolving when unregistration is complete.
  */
 async function unregisterForPushNotifications(): Promise<void> {
-  return await invoke("plugin:notifications|unregister_for_push_notifications");
+  await invoke("plugin:notifications|unregister_for_push_notifications");
+}
+
+/**
+ * Lists currently running UnifiedPush distributors by D-Bus bus name
+ * (e.g. `org.unifiedpush.Distributor.ntfy`).
+ *
+ * **Linux only, and only when the plugin was built with the
+ * `push-notifications` Rust feature** (the Tauri commands are gated behind
+ * `#[cfg(all(target_os = "linux", feature = "push-notifications"))]`).
+ * Throws elsewhere because the command isn't registered.
+ *
+ * Returns an empty array when no UnifiedPush distributor is installed —
+ * this is the signal to prompt the user to install one
+ * (https://unifiedpush.org/users/distributors/).
+ *
+ * @example
+ * ```typescript
+ * import { listDistributors } from '@choochmeque/tauri-plugin-notifications-api';
+ * const distributors = await listDistributors();
+ * if (distributors.length === 0) {
+ *   alert('Please install a UnifiedPush distributor');
+ * }
+ * ```
+ *
+ * @returns A promise resolving to the list of distributor bus names.
+ * @platform linux
+ */
+async function listDistributors(): Promise<string[]> {
+  return await invoke("plugin:notifications|list_distributors");
+}
+
+/**
+ * Pins the UnifiedPush distributor used for the next
+ * {@link registerForPushNotifications} call.
+ *
+ * **Linux only, and only when the plugin was built with the
+ * `push-notifications` Rust feature.** Throws elsewhere because the
+ * underlying Tauri command isn't registered.
+ *
+ * **Must be called before {@link registerForPushNotifications}.** Calling
+ * this after a successful register has no effect on the existing endpoint
+ * — to switch distributors, unregister and register again.
+ *
+ * The selection lives only for the current process — it is **not persisted**
+ * across launches. If the host app wants to remember the user's choice, it
+ * must store the name itself and re-apply it via this function on startup.
+ * If never called, the first distributor returned by {@link listDistributors}
+ * is used.
+ *
+ * @example
+ * ```typescript
+ * import { setDistributor } from '@choochmeque/tauri-plugin-notifications-api';
+ * await setDistributor('org.unifiedpush.Distributor.ntfy');
+ * ```
+ *
+ * @param name The distributor bus name. Must be one of the values returned
+ *             by {@link listDistributors}; otherwise rejects.
+ * @platform linux
+ */
+async function setDistributor(name: string): Promise<void> {
+  await invoke("plugin:notifications|set_distributor", { name });
+}
+
+/**
+ * Sets the UnifiedPush client token used on subsequent
+ * {@link registerForPushNotifications} calls.
+ *
+ * **Linux only, and only when the plugin was built with the
+ * `push-notifications` Rust feature.** Throws elsewhere because the
+ * underlying Tauri command isn't registered.
+ *
+ * **Must be called before {@link registerForPushNotifications}.** Calling
+ * this after a successful register has no effect on the existing endpoint
+ * — to get a different endpoint URL, unregister and register again.
+ *
+ * UnifiedPush distributors derive the endpoint URL from
+ * `(connector_bus_name, client_token)`, so apps that want endpoint
+ * stability across launches should persist a token (any non-empty string,
+ * usually a UUID) and call this on startup before registering. If never
+ * called, a fresh UUID is generated on each register call and the endpoint
+ * URL will be unique per launch — the same model as FCM/APNs token
+ * rotation, where the app pushes the new token to its backend each time.
+ *
+ * The token lives only for the current process — it is **not persisted**
+ * across launches.
+ *
+ * @example
+ * ```typescript
+ * import { setToken, registerForPushNotifications } from '@choochmeque/tauri-plugin-notifications-api';
+ * const storedToken = localStorage.getItem('up-client-token') ?? crypto.randomUUID();
+ * localStorage.setItem('up-client-token', storedToken);
+ * await setToken(storedToken);
+ * const endpoint = await registerForPushNotifications();
+ * ```
+ *
+ * @param token The client token. Must be non-empty.
+ * @platform linux
+ */
+async function setToken(token: string): Promise<void> {
+  await invoke("plugin:notifications|set_token", { token });
 }
 
 /** VAPID / Web Push public key set provided by the distributor for encrypted push. */
@@ -918,7 +1094,7 @@ async function removeActive(
  * @returns A promise indicating the success or failure of the operation.
  */
 async function removeAllActive(): Promise<void> {
-  await invoke("plugin:notifications|remove_active");
+  await invoke("plugin:notifications|remove_all");
 }
 
 /**
@@ -1008,13 +1184,86 @@ async function onNotificationReceived(
  * // unlisten();
  * ```
  *
- * @param cb - Callback function to handle notification actions.
+ * @param cb - Callback function to handle notification action results.
  * @returns A promise resolving to a function that removes the listener.
  */
 async function onAction(
-  cb: (notification: Options) => void,
+  cb: (action: ActionPerformedData) => void,
 ): Promise<PluginListener> {
-  return await addPluginListener("notifications", "actionPerformed", cb);
+  return await addNativeListener(actionListeners, "actionPerformed", cb);
+}
+
+// Native delivery stays on until the last JS listener of the event unregisters.
+interface NativeListenerGate {
+  command: string;
+  count: number;
+  lock: Promise<void>;
+}
+
+const actionListeners: NativeListenerGate = {
+  command: "plugin:notifications|set_action_listener_active",
+  count: 0,
+  lock: Promise.resolve(),
+};
+
+const clickListeners: NativeListenerGate = {
+  command: "plugin:notifications|set_click_listener_active",
+  count: 0,
+  lock: Promise.resolve(),
+};
+
+function withGateLock<T>(
+  gate: NativeListenerGate,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const result = gate.lock.then(() => operation());
+  gate.lock = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function addNativeListener<T>(
+  gate: NativeListenerGate,
+  event: string,
+  cb: (payload: T) => void,
+): Promise<PluginListener> {
+  const listener = await addPluginListener("notifications", event, cb);
+  try {
+    await withGateLock(gate, async () => {
+      if (gate.count === 0) {
+        await invoke(gate.command, { active: true });
+      }
+      gate.count += 1;
+    });
+  } catch (error) {
+    await listener.unregister();
+    throw error;
+  }
+
+  // Shared so concurrent calls neither decrement twice nor resolve before the real unregister finishes.
+  let inFlight: Promise<void> | undefined;
+  return {
+    unregister: () =>
+      (inFlight ??= (async () => {
+        try {
+          await withGateLock(gate, async () => {
+            if (gate.count > 1) {
+              gate.count -= 1;
+              return;
+            }
+            // Keep the final listener until native deactivation succeeds.
+            await invoke(gate.command, { active: false });
+            gate.count = 0;
+          });
+        } catch (error) {
+          inFlight = undefined;
+          throw error;
+        }
+        await listener.unregister();
+      })()),
+  } as PluginListener;
 }
 
 /**
@@ -1050,29 +1299,12 @@ interface NotificationClickedData {
 async function onNotificationClicked(
   cb: (data: NotificationClickedData) => void,
 ): Promise<PluginListener> {
-  const listener = await addPluginListener(
-    "notifications",
-    "notificationClicked",
-    cb,
-  );
-
-  // Notify native side so pending cold-start clicks are delivered
-  await invoke("plugin:notifications|set_click_listener_active", {
-    active: true,
-  });
-
-  return {
-    unregister: async () => {
-      await invoke("plugin:notifications|set_click_listener_active", {
-        active: false,
-      });
-      return listener.unregister();
-    },
-  } as PluginListener;
+  return await addNativeListener(clickListeners, "notificationClicked", cb);
 }
 
 export type {
   Attachment,
+  NotificationMessage,
   Options,
   Action,
   ActionType,
@@ -1086,6 +1318,10 @@ export type {
   MessagingStylePerson,
   MessagingStyleMessage,
   MessagingStyleConfig,
+  ActionPerformedData,
+  ActionNotification,
+  PushRegistration,
+  PushProvider,
 };
 
 export {
@@ -1106,6 +1342,9 @@ export {
   onUnifiedPushUnregistered,
   onUnifiedPushError,
   onUnifiedPushTempUnavailable,
+  listDistributors,
+  setDistributor,
+  setToken,
   registerActionTypes,
   pending,
   cancel,

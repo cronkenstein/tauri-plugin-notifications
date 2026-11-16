@@ -19,15 +19,22 @@ const COMMANDS: &[&str] = &[
     "cancel_all",
     "get_pending",
     "remove_active",
+    "remove_all",
     "get_active",
-    "check_permissions",
-    "show",
-    "batch",
     "list_channels",
     "delete_channel",
     "create_channel",
-    "permission_state",
     "set_click_listener_active",
+    "set_action_listener_active",
+    "set_push_message_listener_active",
+    "push_transport",
+    "is_ignoring_battery_optimizations",
+    "request_ignore_battery_optimizations",
+    "can_schedule_exact_alarms",
+    "request_schedule_exact_alarms",
+    "list_distributors",
+    "set_distributor",
+    "set_token",
 ];
 
 fn main() {
@@ -78,6 +85,10 @@ fn main() {
     {
         // Only run macOS-specific build steps when building for macOS
         if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" {
+            // Rebuild when target architecture or deployment target changes
+            println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+            println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+
             let bridges = vec!["src/macos.rs"];
             for path in &bridges {
                 println!("cargo:rerun-if-changed={path}");
@@ -106,25 +117,32 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn compile_swift() {
     let swift_package_dir = manifest_dir().join("macos");
+    let target_triple = swift_target_triple();
 
     let mut cmd = Command::new("swift");
 
-    cmd.current_dir(swift_package_dir).arg("build");
-
-    // Match Cargo's target arch so Intel / universal cross-builds link correctly.
-    for arch in swift_arches() {
-        cmd.args(["--arch", arch]);
-    }
-
-    cmd.args([
-        "-Xswiftc",
-        "-import-objc-header",
-        "-Xswiftc",
-        swift_source_dir()
-            .join("bridging-header.h")
-            .to_str()
-            .expect("Bridging header path must be valid UTF-8"),
-    ]);
+    cmd.current_dir(&swift_package_dir)
+        .arg("build")
+        // Build into OUT_DIR (under target/) instead of the default `.build`
+        // inside the crate source. Source-tree writes don't survive a clean
+        // registry re-extraction / cache restore, which leaves cargo's
+        // fingerprint saying "built" while the linked artifact is gone.
+        .args([
+            "--scratch-path",
+            swift_build_dir()
+                .to_str()
+                .expect("Swift build path must be valid UTF-8"),
+        ])
+        .args(["--triple", &target_triple])
+        .args([
+            "-Xswiftc",
+            "-import-objc-header",
+            "-Xswiftc",
+            swift_source_dir()
+                .join("bridging-header.h")
+                .to_str()
+                .expect("Bridging header path must be valid UTF-8"),
+        ]);
 
     if is_release_build() {
         cmd.args(["-c", "release"]);
@@ -136,43 +154,17 @@ fn compile_swift() {
         .wait_with_output()
         .expect("Failed to wait for swift build output");
 
-    if !exit_status.status.success() {
-        panic!(
-            r#"
+    assert!(
+        exit_status.status.success(),
+        r"
+Swift build failed for target: {}
 Stderr: {}
 Stdout: {}
-"#,
-            String::from_utf8(exit_status.stderr).expect("Stderr must be valid UTF-8"),
-            String::from_utf8(exit_status.stdout).expect("Stdout must be valid UTF-8"),
-        )
-    }
-}
-
-/// Swift `--arch` values for the current Cargo TARGET.
-#[cfg(target_os = "macos")]
-fn swift_arches() -> Vec<&'static str> {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if target.starts_with("x86_64-") {
-        vec!["x86_64"]
-    } else if target.starts_with("aarch64-") || target.starts_with("arm64-") {
-        vec!["arm64"]
-    } else {
-        // Host default (no --arch).
-        Vec::new()
-    }
-}
-
-/// SPM places arch-specific products under `.build/<triple>/{debug,release}`.
-#[cfg(target_os = "macos")]
-fn swift_target_triple() -> Option<&'static str> {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if target.starts_with("x86_64-") {
-        Some("x86_64-apple-macosx")
-    } else if target.starts_with("aarch64-") || target.starts_with("arm64-") {
-        Some("arm64-apple-macosx")
-    } else {
-        None
-    }
+",
+        target_triple,
+        String::from_utf8(exit_status.stderr).expect("Stderr must be valid UTF-8"),
+        String::from_utf8(exit_status.stdout).expect("Stdout must be valid UTF-8"),
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -184,6 +176,19 @@ fn swift_bridge_out_dir() -> PathBuf {
 fn manifest_dir() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
     PathBuf::from(manifest_dir)
+}
+
+#[cfg(target_os = "macos")]
+fn out_dir() -> PathBuf {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set");
+    PathBuf::from(out_dir)
+}
+
+/// `SwiftPM` scratch (build) directory, under `OUT_DIR` so it lives in `target/`
+/// and is covered by cargo's fingerprint and any build cache.
+#[cfg(target_os = "macos")]
+fn swift_build_dir() -> PathBuf {
+    out_dir().join("swift-build")
 }
 
 #[cfg(target_os = "macos")]
@@ -202,6 +207,30 @@ fn generated_code_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
+fn target_arch() -> String {
+    std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH must be set")
+}
+
+#[cfg(target_os = "macos")]
+fn swift_arch() -> &'static str {
+    match target_arch().as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        arch => panic!("Unsupported architecture for macOS: {arch}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_deployment_target() -> String {
+    std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn swift_target_triple() -> String {
+    format!("{}-apple-macosx{}", swift_arch(), macos_deployment_target())
+}
+
+#[cfg(target_os = "macos")]
 fn swift_library_static_lib_dir() -> PathBuf {
     let debug_or_release = if is_release_build() {
         "release"
@@ -209,9 +238,16 @@ fn swift_library_static_lib_dir() -> PathBuf {
         "debug"
     };
 
-    if let Some(triple) = swift_target_triple() {
-        manifest_dir().join(format!("macos/.build/{triple}/{debug_or_release}"))
-    } else {
-        manifest_dir().join(format!("macos/.build/{debug_or_release}"))
+    let arch_dir = format!("{}-apple-macosx", swift_arch());
+    let legacy_dir = swift_build_dir().join(format!("{arch_dir}/{debug_or_release}"));
+    if legacy_dir.join("libtauri-plugin-notifications.a").exists() {
+        return legacy_dir;
     }
+
+    let product_config = if is_release_build() {
+        "Release"
+    } else {
+        "Debug"
+    };
+    swift_build_dir().join("out/Products").join(product_config)
 }

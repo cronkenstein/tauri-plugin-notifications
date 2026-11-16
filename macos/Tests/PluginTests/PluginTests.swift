@@ -26,7 +26,7 @@ private func makeTestNotification(
     sound: String? = nil,
     group: String? = nil,
     actionTypeId: String? = nil,
-    extra: [String: String]? = nil,
+    extra: [String: JSONValue]? = nil,
     silent: Bool? = nil
 ) -> PluginNotification {
     return PluginNotification(
@@ -235,8 +235,8 @@ final class NotificationTests: XCTestCase {
         XCTAssertEqual(notification.id, 456)
         XCTAssertEqual(notification.title, "Reminder")
         XCTAssertEqual(notification.body, "Don't forget!")
-        XCTAssertEqual(notification.extra?["key1"], "value1")
-        XCTAssertEqual(notification.extra?["key2"], "value2")
+        XCTAssertEqual(notification.extra?["key1"], .string("value1"))
+        XCTAssertEqual(notification.extra?["key2"], .string("value2"))
         XCTAssertEqual(notification.sound, "notification.wav")
         XCTAssertEqual(notification.group, "reminders")
         XCTAssertEqual(notification.actionTypeId, "reminder_actions")
@@ -797,6 +797,34 @@ final class HelperFunctionTests: XCTestCase {
         XCTAssertEqual(result[UNNotificationAttachmentOptionsTypeHintKey] as? String, "public.png")
     }
 
+    func testMakeAttachmentOptionsUseTheTypesUserNotificationsExpects() {
+        let options = NotificationAttachmentOptions(
+            iosUNNotificationAttachmentOptionsTypeHintKey: nil,
+            iosUNNotificationAttachmentOptionsThumbnailHiddenKey: "true",
+            iosUNNotificationAttachmentOptionsThumbnailClippingRectKey: "0.1,0.2,0.5,0.6",
+            iosUNNotificationAttachmentOptionsThumbnailTimeKey: "2.5"
+        )
+
+        let result = makeAttachmentOptions(options)
+        XCTAssertEqual(result[UNNotificationAttachmentOptionsThumbnailHiddenKey] as? NSNumber, true)
+        XCTAssertEqual(result[UNNotificationAttachmentOptionsThumbnailTimeKey] as? NSNumber, 2.5)
+        let rect = CGRect(
+            dictionaryRepresentation: result[UNNotificationAttachmentOptionsThumbnailClippingRectKey]
+                as! CFDictionary)
+        XCTAssertEqual(rect, CGRect(x: 0.1, y: 0.2, width: 0.5, height: 0.6))
+    }
+
+    func testMakeAttachmentOptionsDropUnparsableValues() {
+        let options = NotificationAttachmentOptions(
+            iosUNNotificationAttachmentOptionsTypeHintKey: nil,
+            iosUNNotificationAttachmentOptionsThumbnailHiddenKey: "maybe",
+            iosUNNotificationAttachmentOptionsThumbnailClippingRectKey: "1,2",
+            iosUNNotificationAttachmentOptionsThumbnailTimeKey: "soon"
+        )
+
+        XCTAssertTrue(makeAttachmentOptions(options).isEmpty)
+    }
+
     func testMakeAttachmentOptionsEmpty() {
         let options = NotificationAttachmentOptions(
             iosUNNotificationAttachmentOptionsTypeHintKey: nil,
@@ -825,15 +853,13 @@ final class NotificationContentTests: XCTestCase {
 
     func testMakeNotificationContentWithExtra() throws {
         let notification = makeTestNotification(
-            extra: ["key1": "value1", "key2": "value2"]
+            extra: ["key1": .string("value1"), "key2": .string("value2")]
         )
 
         let content = try makeNotificationContent(notification)
 
-        let extra = content.userInfo["__EXTRA__"] as? [String: String]
-        XCTAssertNotNil(extra)
-        XCTAssertEqual(extra?["key1"], "value1")
-        XCTAssertEqual(extra?["key2"], "value2")
+        XCTAssertEqual(content.userInfo["key1"] as? String, "value1")
+        XCTAssertEqual(content.userInfo["key2"] as? String, "value2")
     }
 
     func testMakeNotificationContentWithActionType() throws {
@@ -893,13 +919,49 @@ final class ScheduleHandlerTests: XCTestCase {
 
         let trigger = try handleScheduledNotification(schedule)
 
-        XCTAssertNotNil(trigger)
-        XCTAssertTrue(trigger is UNTimeIntervalNotificationTrigger)
+        let calendarTrigger = try XCTUnwrap(trigger as? UNCalendarNotificationTrigger)
+        XCTAssertTrue(calendarTrigger.repeats)
+        XCTAssertNotNil(calendarTrigger.dateComponents.hour)
+        XCTAssertNil(calendarTrigger.dateComponents.day)
+    }
 
-        let timeTrigger = trigger as! UNTimeIntervalNotificationTrigger
-        XCTAssertTrue(timeTrigger.repeats)
-        // 1 day = 86400 seconds
-        XCTAssertEqual(timeTrigger.timeInterval, 86400, accuracy: 1)
+    func testHandleScheduledNotificationEveryMonthAndYearMatchCalendarFields() throws {
+        let month = try XCTUnwrap(
+            try handleScheduledNotification(.every(interval: .month, count: 1))
+                as? UNCalendarNotificationTrigger)
+        XCTAssertNotNil(month.dateComponents.day)
+        XCTAssertNil(month.dateComponents.month)
+
+        let year = try XCTUnwrap(
+            try handleScheduledNotification(.every(interval: .year, count: 1))
+                as? UNCalendarNotificationTrigger)
+        XCTAssertNotNil(year.dateComponents.month)
+        XCTAssertNotNil(year.dateComponents.day)
+
+        let week = try XCTUnwrap(
+            try handleScheduledNotification(.every(interval: .week, count: 1))
+                as? UNCalendarNotificationTrigger)
+        XCTAssertNotNil(week.dateComponents.weekday)
+    }
+
+    func testHandleScheduledNotificationEveryMultipleDaysKeepsFixedInterval() throws {
+        let trigger = try XCTUnwrap(
+            try handleScheduledNotification(.every(interval: .day, count: 2))
+                as? UNTimeIntervalNotificationTrigger)
+        XCTAssertTrue(trigger.repeats)
+        XCTAssertEqual(trigger.timeInterval, 2 * 86400, accuracy: 1)
+    }
+
+    func testHandleScheduledNotificationRepeatingAtMatchesWallClockTime() throws {
+        let future = Date().addingTimeInterval(7200)
+        let schedule = NotificationSchedule.at(
+            date: ISO8601DateFormatter().string(from: future), repeating: true)
+        let trigger = try XCTUnwrap(try handleScheduledNotification(schedule) as? UNCalendarNotificationTrigger)
+        let expected = Calendar.current.dateComponents([.hour, .minute, .second], from: future)
+        XCTAssertTrue(trigger.repeats)
+        XCTAssertEqual(trigger.dateComponents.hour, expected.hour)
+        XCTAssertEqual(trigger.dateComponents.minute, expected.minute)
+        XCTAssertEqual(trigger.dateComponents.second, expected.second)
     }
 
     func testHandleScheduledNotificationInterval() throws {
@@ -989,27 +1051,6 @@ final class ScheduleHandlerTests: XCTestCase {
                 // Expected
             } else {
                 XCTFail("Expected invalidDate error")
-            }
-        }
-    }
-
-    func testHandleScheduledNotificationRepeatingTooShort() throws {
-        // Create a date just 30 seconds in the future with repeating
-        let futureDate = Calendar.current.date(byAdding: .second, value: 30, to: Date())!
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
-        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
-        let dateString = dateFormatter.string(from: futureDate)
-
-        let schedule = NotificationSchedule.at(date: dateString, repeating: true)
-
-        XCTAssertThrowsError(try handleScheduledNotification(schedule)) { error in
-            XCTAssertTrue(error is NotificationError)
-            if case NotificationError.triggerRepeatIntervalTooShort = error {
-                // Expected
-            } else {
-                XCTFail("Expected triggerRepeatIntervalTooShort error")
             }
         }
     }
@@ -1291,12 +1332,7 @@ final class NotificationHandlerTests: XCTestCase {
 
     func testSaveAndRetrieveNotification() {
         let notification = makeTestNotification(id: 123, title: "Saved", body: "Body")
-        handler.saveNotification("123", notification)
-
-        // Create a mock request to test retrieval
-        let content = UNMutableNotificationContent()
-        content.title = "Saved"
-        content.body = "Body"
+        let content = try! makeNotificationContent(notification)
         let request = UNNotificationRequest(identifier: "123", content: content, trigger: nil)
 
         let activeNotification = handler.toActiveNotification(request)
@@ -1326,10 +1362,7 @@ final class NotificationHandlerTests: XCTestCase {
     func testToPendingNotificationWithSchedule() {
         let schedule = NotificationSchedule.every(interval: .hour, count: 1)
         let notification = makeTestNotification(id: 456, title: "Scheduled", schedule: schedule)
-        handler.saveNotification("456", notification)
-
-        let content = UNMutableNotificationContent()
-        content.title = "Scheduled"
+        let content = try! makeNotificationContent(notification)
         let request = UNNotificationRequest(identifier: "456", content: content, trigger: nil)
 
         let pendingNotification = handler.toPendingNotification(request)

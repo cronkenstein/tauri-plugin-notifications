@@ -1,6 +1,7 @@
 import java.util.Properties
 import java.io.FileInputStream
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.plugin.getKotlinPluginVersion
 
 plugins {
     id("com.android.library")
@@ -15,6 +16,8 @@ val buildProperties = Properties().apply {
     }
 }
 
+val enablePush = buildProperties.getProperty("enablePushNotifications", "false").toBoolean()
+
 android {
     namespace = "app.tauri.notification"
     compileSdk = 36
@@ -25,13 +28,27 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
 
-        val enablePush = buildProperties.getProperty("enablePushNotifications", "false").toBoolean()
+        // Enable push notifications based on Cargo feature flag
         buildConfigField("boolean", "ENABLE_PUSH_NOTIFICATIONS", "$enablePush")
 
         val enableUnifiedPush = buildProperties.getProperty("enableUnifiedPush", "false").toBoolean()
         buildConfigField("boolean", "ENABLE_UNIFIED_PUSH", "$enableUnifiedPush")
+    }
 
-        manifestPlaceholders["unifiedPushReceiverEnabled"] = "$enableUnifiedPush"
+    // The embedded distributor's service, permissions and boot receiver only merge into
+    // apps that enabled the push feature. A source set holds one manifest, so it rides
+    // on the build types rather than on main or the flavors.
+    if (enablePush) {
+        listOf("debug", "release").forEach {
+            sourceSets.getByName(it).manifest.srcFile("src/push/AndroidManifest.xml")
+        }
+    }
+
+    // FCM pulls proprietary Google libraries that FOSS repos reject.
+    flavorDimensions += "push"
+    productFlavors {
+        create("gms")
+        create("foss")
     }
 
     buildTypes {
@@ -69,30 +86,47 @@ android {
     }
 }
 
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlin:kotlin-stdlib:${getKotlinPluginVersion()}")
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
-    implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("com.google.android.material:material:1.13.0")
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
+    implementation("androidx.work:work-runtime:2.11.2")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.22.1")
 
-    implementation(platform("com.google.firebase:firebase-bom:34.7.0"))
-    implementation("com.google.firebase:firebase-messaging-ktx:24.1.2")
-
-    implementation("org.unifiedpush.android:connector:3.3.2")
-
+    "gmsImplementation"("com.google.android.gms:play-services-base:18.9.0")
+    // Direct FCM token registration (the FcmBridge gms seam). Kept out of foss,
+    // which must stay free of Google libraries.
+    "gmsImplementation"(platform("com.google.firebase:firebase-bom:34.7.0"))
+    "gmsImplementation"("com.google.firebase:firebase-messaging-ktx:24.1.2")
+    implementation("com.squareup.okhttp3:okhttp:5.4.0")
+    implementation("org.unifiedpush.android:connector:3.3.5")
+    // The connector declares Tink as a runtime-only dependency, so its WebPush
+    // classes (`apps.fixed_webpush`) would not be on our compile classpath;
+    // depend on the same artifact/version explicitly. Using the plain `tink`
+    // artifact (not `tink-android`) keeps a single copy of the classes on the
+    // classpath — `tink-android` repackages the same classes and trips AGP's
+    // duplicate-class check.
+    implementation("com.google.crypto.tink:tink:1.23.0")
+    implementation("org.unifiedpush.android:embedded-fcm-distributor:3.1.0")
     testImplementation("junit:junit:4.13.2")
-    testImplementation("io.mockk:mockk-android:1.14.9")
-    testImplementation("io.mockk:mockk-agent:1.14.9")
+    testImplementation("androidx.work:work-testing:2.11.2")
+    testImplementation("io.mockk:mockk-android:1.14.11")
+    testImplementation("io.mockk:mockk-agent:1.14.11")
     testImplementation("org.jetbrains.kotlin:kotlin-test:2.3.0")
-    testImplementation("org.json:json:20251224")
+    testImplementation("org.json:json:20260522")
     testImplementation("org.robolectric:robolectric:4.16.1")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
     implementation(project(":tauri-android"))
 }
 
+// gms only: aggregating both flavours gives Jacoco two FcmBridge classes at one FQN.
 tasks.register<JacocoReport>("jacocoTestReport") {
-    dependsOn("testDebugUnitTest")
+    dependsOn("testGmsDebugUnitTest")
 
     reports {
         xml.required.set(true)
@@ -109,7 +143,7 @@ tasks.register<JacocoReport>("jacocoTestReport") {
         "android/**/*.*"
     )
 
-    val debugTree = fileTree("${layout.buildDirectory.get().asFile}/tmp/kotlin-classes/debug") {
+    val debugTree = fileTree("${layout.buildDirectory.get().asFile}/tmp/kotlin-classes/gmsDebug") {
         exclude(fileFilter)
     }
 
@@ -117,10 +151,11 @@ tasks.register<JacocoReport>("jacocoTestReport") {
 
     sourceDirectories.setFrom(files(listOf(
         "$mainSrc/main/java",
-        "$mainSrc/main/kotlin"
+        "$mainSrc/main/kotlin",
+        "$mainSrc/gms/java"
     )))
     classDirectories.setFrom(files(debugTree))
     executionData.setFrom(fileTree(layout.buildDirectory.get().asFile) {
-        include("outputs/unit_test_code_coverage/debugUnitTest/testDebugUnitTest.exec")
+        include("outputs/unit_test_code_coverage/gmsDebugUnitTest/testGmsDebugUnitTest.exec")
     })
 }

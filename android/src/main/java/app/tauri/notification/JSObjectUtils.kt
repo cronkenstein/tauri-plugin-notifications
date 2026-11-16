@@ -9,7 +9,7 @@ import org.json.JSONObject
  * Shared helpers for recursively converting native Kotlin values (Maps, Lists, primitives)
  * into [JSObject] / [JSArray] structures understood by the Tauri plugin bridge.
  *
- * Both [NotificationPlugin] and [TauriUnifiedPushMessagingService] need to convert
+ * Both [NotificationPlugin] and the UnifiedPush message path need to convert
  * the push-data maps they receive into JS-bridge types; keeping the logic in one
  * place prevents the two copies from drifting apart.
  */

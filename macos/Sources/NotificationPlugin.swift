@@ -45,11 +45,52 @@ struct NotificationAttachment: Codable {
   let options: NotificationAttachmentOptions?
 }
 
+enum JSONValue: Decodable, Equatable {
+  case null
+  case bool(Bool)
+  case integer(Int64)
+  case double(Double)
+  case string(String)
+  case array([JSONValue])
+  case object([String: JSONValue])
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    if container.decodeNil() {
+      self = .null
+    } else if let value = try? container.decode(Bool.self) {
+      self = .bool(value)
+    } else if let value = try? container.decode(Int64.self) {
+      self = .integer(value)
+    } else if let value = try? container.decode(Double.self) {
+      self = .double(value)
+    } else if let value = try? container.decode(String.self) {
+      self = .string(value)
+    } else if let value = try? container.decode([JSONValue].self) {
+      self = .array(value)
+    } else {
+      self = .object(try container.decode([String: JSONValue].self))
+    }
+  }
+
+  var foundationValue: Any {
+    switch self {
+    case .null: return NSNull()
+    case .bool(let value): return value
+    case .integer(let value): return NSNumber(value: value)
+    case .double(let value): return NSNumber(value: value)
+    case .string(let value): return value
+    case .array(let values): return values.map(\.foundationValue)
+    case .object(let values): return values.mapValues(\.foundationValue)
+    }
+  }
+}
+
 struct Notification: Decodable {
   let id: Int
-  var title: String
+  var title: String?
   var body: String?
-  var extra: [String: String]?
+  var extra: [String: JSONValue]?
   var schedule: NotificationSchedule?
   var attachments: [NotificationAttachment]?
   var sound: String?
@@ -93,6 +134,10 @@ struct SetClickListenerActiveArgs: Decodable {
   let active: Bool
 }
 
+struct SetActionListenerActiveArgs: Decodable {
+  let active: Bool
+}
+
 struct RemoveActiveNotification: Decodable {
   let id: Int
 }
@@ -130,7 +175,7 @@ extension Encodable {
   }
 }
 
-func showNotification(notification: Notification) async throws(FFIResult) -> UNNotificationRequest {
+func showNotification(notification: Notification) async throws(FFIResult) {
   var content: UNNotificationContent
   do {
     content = try makeNotificationContent(notification)
@@ -150,17 +195,31 @@ func showNotification(notification: Notification) async throws(FFIResult) -> UNN
 
   // Schedule the request.
   let request = UNNotificationRequest(
-    identifier: "\(notification.id)", content: content, trigger: trigger
+    identifier: notificationRequestIdentifier(notification), content: content, trigger: trigger
   )
 
   let center = UNUserNotificationCenter.current()
   do {
+    if request.trigger == nil && content.userInfo["event_id"] != nil {
+      let delivered = await center.deliveredNotifications()
+      let matching = delivered.filter {
+        NotificationHandler.matchesMessage($0.request.content.userInfo, content.userInfo)
+      }
+      if !matching.isEmpty {
+        guard !matching.contains(where: { $0.request.content.body == content.body }) else { return }
+        // Enrichment changes content, not the event: replace it without a second sound.
+        guard let updated = content.mutableCopy() as? UNMutableNotificationContent else { return }
+        updated.sound = nil
+        center.removeDeliveredNotifications(withIdentifiers: matching.map { $0.request.identifier })
+        try await center.add(
+          UNNotificationRequest(identifier: request.identifier, content: updated, trigger: nil))
+        return
+      }
+    }
     try await center.add(request)
   } catch {
     throw FFIResult.Err(RustString(error.localizedDescription))
   }
-
-  return request
 }
 
 class NotificationPlugin {
@@ -168,10 +227,16 @@ class NotificationPlugin {
   let notificationManager = NotificationManager()
 
   #if ENABLE_PUSH_NOTIFICATIONS
-    // Completion handler for push token registration
-    private var pushTokenCompletion: ((Result<String, Error>) -> Void)?
+    // Push registration state is only touched on the main queue.
+    private struct PushTokenWaiter {
+      let id: UInt64
+      let completion: (Result<String, Error>) -> Void
+      let timer: Timer
+    }
+    private var pushTokenWaiters = [PushTokenWaiter]()
+    var isRegisteringPush: Bool { !pushTokenWaiters.isEmpty }
+    private var nextPushTokenWaiterId: UInt64 = 0
     private let pushTokenTimeout: TimeInterval = 10.0
-    private var pushTokenTimer: Timer?
   #endif
 
   init() {
@@ -190,9 +255,8 @@ class NotificationPlugin {
   public func show(args: RustString) async throws(FFIResult) -> Int32 {
     let notification = try args.decode(Notification.self)
 
-    let request = try await showNotification(notification: notification)
-    notificationHandler.saveNotification(request.identifier, notification)
-    return Int32(request.identifier) ?? -1
+    try await showNotification(notification: notification)
+    return Int32(truncatingIfNeeded: notification.id)
   }
 
   public func requestPermissions() async throws(FFIResult) -> String {
@@ -207,10 +271,9 @@ class NotificationPlugin {
 
   public func registerForPushNotifications() async throws(FFIResult) -> String {
     #if ENABLE_PUSH_NOTIFICATIONS
-      // First request notification permissions
       let granted: Bool
       do {
-        granted = try await notificationHandler.requestPermissions()
+        granted = try await notificationHandler.ensureDeliveryAllowed()
       } catch {
         throw FFIResult.Err(RustString("Failed to request notification permissions: \(error.localizedDescription)"))
       }
@@ -239,6 +302,10 @@ class NotificationPlugin {
     #if ENABLE_PUSH_NOTIFICATIONS
       DispatchQueue.main.async {
         NSApplication.shared.unregisterForRemoteNotifications()
+        self.handlePushTokenError(NSError(
+          domain: "NotificationPlugin", code: -2,
+          userInfo: [NSLocalizedDescriptionKey: "Push registration cancelled"]
+        ))
       }
     #else
       throw FFIResult.Err(RustString("Push notifications are disabled in this build"))
@@ -292,22 +359,31 @@ class NotificationPlugin {
 
   public func removeActive(args: RustString) throws(FFIResult) {
     let args = try args.decode(RemoveActiveArgs.self)
-    UNUserNotificationCenter.current().removeDeliveredNotifications(
-      withIdentifiers: args.notifications.map { String($0.id) })
+    let ids = Set(args.notifications.map { $0.id })
+    guard !ids.isEmpty else { return }
+    let center = UNUserNotificationCenter.current()
+    center.getDeliveredNotifications { [weak self] delivered in
+      guard let handler = self?.notificationHandler else { return }
+      center.removeDeliveredNotifications(
+        withIdentifiers: delivered.filter { handler.matches($0.request, ids: ids) }
+          .map { $0.request.identifier })
+    }
   }
 
   public func removeAllActive() throws(FFIResult) {
-    UNUserNotificationCenter.current().removeAllDeliveredNotifications()
-    DispatchQueue.main.async {
-      NSApp.dockTile.badgeLabel = nil
+    let center = UNUserNotificationCenter.current()
+    center.removeAllDeliveredNotifications()
+    center.setBadgeCount(0) { error in
+      if let error { NSLog("tauri-plugin-notifications: failed to clear the badge: \(error)") }
     }
   }
 
   public func getActive() async throws(FFIResult) -> String {
     let notifications = await UNUserNotificationCenter.current().deliveredNotifications()
 
-    let ret = notifications.compactMap({ (notification) -> ActiveNotification? in
+    let ret = notifications.map({ (notification) -> ActiveNotification in
       return self.notificationHandler.toActiveNotification(notification.request)
+        ?? self.notificationHandler.toRemoteActionNotification(notification.request)
     })
 
     return try ret.toJSONString()
@@ -318,60 +394,62 @@ class NotificationPlugin {
     notificationHandler.setClickListenerActive(args.active)
   }
 
+  public func setActionListenerActive(args: RustString) throws(FFIResult) {
+    let args = try args.decode(SetActionListenerActiveArgs.self)
+    notificationHandler.setActionListenerActive(args.active)
+  }
+
   #if ENABLE_PUSH_NOTIFICATIONS
     private func registerForPushNotificationsWithCompletion(_ completion: @escaping (Result<String, Error>) -> Void)
     {
-      // Store completion for later
-      self.pushTokenCompletion = completion
+      // The caller's thread may have no running run loop, so the Timer would never fire.
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else {
+          completion(.failure(NSError(
+            domain: "NotificationPlugin", code: -2,
+            userInfo: [NSLocalizedDescriptionKey: "Notification plugin unavailable"]
+          )))
+          return
+        }
+        AppDelegateSwizzler.swizzlePushCallbacks()
+        self.nextPushTokenWaiterId += 1
+        let id = self.nextPushTokenWaiterId
+        let timer = Timer.scheduledTimer(withTimeInterval: self.pushTokenTimeout, repeats: false) {
+          [weak self] _ in
+          self?.handlePushTokenTimeout(waiter: id)
+        }
+        self.pushTokenWaiters.append(PushTokenWaiter(id: id, completion: completion, timer: timer))
+        guard self.pushTokenWaiters.count == 1 else { return }
 
-      // Set up timeout
-      self.pushTokenTimer?.invalidate()
-      self.pushTokenTimer = Timer.scheduledTimer(withTimeInterval: pushTokenTimeout, repeats: false)
-      { [weak self] _ in
-        self?.handlePushTokenTimeout()
-      }
-
-      // Register for remote notifications
-      DispatchQueue.main.async {
         NSApplication.shared.registerForRemoteNotifications()
       }
     }
 
-    private func handlePushTokenTimeout() {
-      pushTokenTimer?.invalidate()
-      pushTokenTimer = nil
+    private func handlePushTokenTimeout(waiter id: UInt64) {
+      guard let index = pushTokenWaiters.firstIndex(where: { $0.id == id }) else { return }
+      let waiter = pushTokenWaiters.remove(at: index)
+      waiter.completion(.failure(NSError(
+        domain: "NotificationPlugin",
+        code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "Timeout waiting for device token"]
+      )))
+    }
 
-      if let completion = pushTokenCompletion {
-        pushTokenCompletion = nil
-        let error = NSError(
-          domain: "NotificationPlugin",
-          code: -1,
-          userInfo: [NSLocalizedDescriptionKey: "Timeout waiting for device token"]
-        )
-        completion(.failure(error))
+    private func settlePushCompletions(_ result: Result<String, Error>) {
+      let waiters = pushTokenWaiters
+      pushTokenWaiters.removeAll()
+      waiters.forEach {
+        $0.timer.invalidate()
+        $0.completion(result)
       }
     }
 
-    // Called by AppDelegateSwizzler when token is received
     func handlePushTokenReceived(_ token: String) {
-      pushTokenTimer?.invalidate()
-      pushTokenTimer = nil
-
-      if let completion = pushTokenCompletion {
-        pushTokenCompletion = nil
-        completion(.success(token))
-      }
+      settlePushCompletions(.success(token))
     }
 
-    // Called by AppDelegateSwizzler when registration fails
     func handlePushTokenError(_ error: Error) {
-      pushTokenTimer?.invalidate()
-      pushTokenTimer = nil
-
-      if let completion = pushTokenCompletion {
-        pushTokenCompletion = nil
-        completion(.failure(error))
-      }
+      settlePushCompletions(.failure(error))
     }
   #endif
 
@@ -383,6 +461,41 @@ class NotificationPlugin {
         userInfo: [NSLocalizedDescriptionKey: "Failed to encode data to JSON string"])
     }
     try bridgeTrigger(RustString(event), RustString(jsonString))
+  }
+
+  func emitJSON(_ event: String, object: Any) {
+    guard JSONSerialization.isValidJSONObject(object),
+      let data = try? JSONSerialization.data(withJSONObject: object),
+      let json = String(data: data, encoding: .utf8)
+    else {
+      NSLog("tauri-plugin-notifications: '\(event)' payload is not valid JSON")
+      return
+    }
+    do {
+      try bridgeTrigger(RustString(event), RustString(json))
+    } catch {
+      NSLog("tauri-plugin-notifications: failed to deliver '\(event)': \(error)")
+    }
+  }
+
+  func emit<T: Encodable>(_ event: String, data: T) {
+    do {
+      try trigger(event, data: data)
+    } catch {
+      NSLog("tauri-plugin-notifications: failed to deliver '\(event)': \(error)")
+    }
+  }
+}
+
+func jsonCompatible(_ value: Any) -> Any {
+  switch value {
+  case let string as String: return string
+  case let number as NSNumber: return number.doubleValue.isFinite ? number : NSNull()
+  case is NSNull: return NSNull()
+  case let array as [Any]: return array.map(jsonCompatible)
+  case let dictionary as [AnyHashable: Any]:
+    return Dictionary(uniqueKeysWithValues: dictionary.map { (String(describing: $0.key), jsonCompatible($0.value)) })
+  default: return String(describing: value)
   }
 }
 

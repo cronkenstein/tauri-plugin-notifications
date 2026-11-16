@@ -1,0 +1,1487 @@
+//! Windows implementation for notifications plugin using native Windows Toast API.
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::{Arc, RwLock, Weak};
+
+use nt_time::FileTime;
+use serde::de::DeserializeOwned;
+use tauri::{
+    AppHandle, Manager, Runtime,
+    plugin::{PermissionState, PluginApi},
+};
+use windows::ApplicationModel::Package;
+use windows::Data::Xml::Dom::XmlDocument;
+use windows::Foundation::{DateTime, TypedEventHandler};
+#[cfg(feature = "push-notifications")]
+use windows::Networking::PushNotifications::{
+    PushNotificationChannel, PushNotificationChannelManager, PushNotificationReceivedEventArgs,
+    PushNotificationType,
+};
+use windows::UI::Notifications::{
+    NotificationSetting, ScheduledToastNotification, ToastActivatedEventArgs, ToastFailedEventArgs,
+    ToastNotification, ToastNotificationManager, ToastNotifier,
+};
+use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, S_FALSE, S_OK};
+use windows::Win32::System::Com::{
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
+    CoResumeClassObjects, CoRevokeClassObject, IClassFactory, IClassFactory_Impl,
+    REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
+};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegSetValueExW,
+};
+use windows::Win32::UI::Notifications::{
+    INotificationActivationCallback, INotificationActivationCallback_Impl,
+    NOTIFICATION_USER_INPUT_DATA,
+};
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, Ref, implement};
+
+use crate::WindowsConfig;
+use crate::activation::{PendingActivations, button_arguments, decode_activation, launch_context};
+
+use crate::models::*;
+
+/// True when the current process has MSIX package identity.
+///
+/// WinRT notification APIs split into two flavors: no-arg variants that use the
+/// package's default AUMID (only valid for packaged apps), and `*WithId`
+/// variants that take an explicit AUMID (only valid for unpackaged apps whose
+/// AUMID is registered via a Start Menu shortcut). Passing an arbitrary string
+/// to the WithId variants from inside an MSIX returns ERROR_NOT_FOUND because
+/// the real AUMID is `<PackageFamilyName>!<Application Id>` and the family-name
+/// hash is install-time only.
+fn is_packaged() -> bool {
+    Package::Current().is_ok()
+}
+
+/// Resolve a user-supplied image string into a URI scheme Windows toast
+/// notifications can actually load.
+///
+/// Microsoft's toast schema only accepts `http(s)://`, `ms-appx:///`,
+/// `ms-appdata:///local/`, and `file:///` for `<image src>`. Anything else
+/// (Android resource names like `ic_notify`, bare relative paths,
+/// `data:` URIs) makes Windows reject the toast XML and surface the
+/// "New notification" placeholder instead of the real title/body.
+///
+/// Mapping:
+/// - already-valid URI scheme → pass through
+/// - absolute filesystem path → promote to `file:///`
+/// - bare name + packaged → `ms-appx:///resources/<name>` (Tauri's
+///   `bundle.resources` convention)
+/// - bare name + unpackaged → resolve via Tauri's `PathResolver`, promote
+///   to `file:///`
+/// - anything else → `None` (caller drops the image, toast keeps rendering)
+fn resolve_toast_image_src<R: Runtime>(
+    app: &AppHandle<R>,
+    input: &str,
+    packaged: bool,
+) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    if is_unc(&lower) {
+        log::warn!("Ignoring notification image {input:?}: network share paths are not loaded");
+        return None;
+    }
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ms-appx://")
+        || lower.starts_with("ms-appdata://")
+        || lower.starts_with("file://")
+    {
+        return Some(input.to_string());
+    }
+    if lower.starts_with("data:") {
+        log::warn!(
+            "Ignoring notification image data: URI: Windows toast schema doesn't \
+             accept inline base64; write the bytes to a file and pass a file:/// URI"
+        );
+        return None;
+    }
+    let path = std::path::Path::new(input);
+    if path.is_absolute() {
+        return Some(path_to_file_uri(path));
+    }
+    if packaged {
+        let trimmed = input.trim_start_matches('/');
+        return Some(format!("ms-appx:///resources/{trimmed}"));
+    }
+    use tauri::path::BaseDirectory;
+    if let Ok(resolved) = app.path().resolve(input, BaseDirectory::Resource) {
+        if resolved.exists() {
+            return Some(path_to_file_uri(&resolved));
+        }
+    }
+    log::warn!(
+        "Ignoring notification image {input:?}: not a supported URI scheme, not an \
+         absolute path, and not resolvable as a Tauri resource"
+    );
+    None
+}
+
+/// `\\server\share`, `//server/share` and `file://server/share` all point at a network share
+/// that Windows would reach out to (leaking NTLM credentials) when loading the image.
+fn is_unc(lower: &str) -> bool {
+    let rest = lower.strip_prefix("file:").unwrap_or(lower);
+    let is_slash = |c: char| c == '/' || c == '\\';
+    let mut chars = rest.chars();
+    if !(chars.next().is_some_and(is_slash) && chars.next().is_some_and(is_slash)) {
+        return false;
+    }
+    // `file:///C:/x` has an empty host and is a local path.
+    chars.next().is_some_and(|c| !is_slash(c))
+}
+
+/// Convert a filesystem path to a `file:///` URI Windows accepts (forward
+/// slashes, no backslashes — required even on Windows).
+fn path_to_file_uri(path: &std::path::Path) -> String {
+    let normalized = path.display().to_string().replace('\\', "/");
+    if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+/// Accept any well-formed UUID string and reinterpret its bytes as a `GUID`.
+///
+/// Delegating to `uuid::Uuid::parse_str` lets the manifest CLSID and the
+/// `tauri.conf.json` CLSID use either braced (`{xxxxxxxx-…}`), unbraced
+/// (`xxxxxxxx-…`), or simple (32 hex chars, no hyphens) conventions without
+/// drift causing parse failures.
+fn parse_clsid(raw: &str) -> windows::core::Result<GUID> {
+    let parsed = uuid::Uuid::parse_str(raw.trim())
+        .map_err(|e| windows::core::Error::new(E_INVALIDARG, format!("{e}")))?;
+    Ok(GUID::from_u128(parsed.as_u128()))
+}
+
+// Enable `?` operator for windows::core::Error
+impl From<windows::core::Error> for crate::Error {
+    fn from(err: windows::core::Error) -> Self {
+        crate::error::rejected(Some(format!("0x{:08X}", err.code().0)), err.message())
+    }
+}
+
+/// Shared plugin state wrapped in Arc for thread-safe access.
+pub struct WindowsPlugin {
+    app_id: String,
+    packaged: bool,
+    notifier: ToastNotifier,
+    focus: Box<dyn Fn() + Send + Sync>,
+    action_types: RwLock<HashMap<String, ActionType>>,
+    /// Drained when a listener for the event registers (see `crate::listeners::register_listener`).
+    pending: PendingActivations,
+    /// `CoRegisterClassObject` cookie. Kept for the process lifetime — no
+    /// explicit `CoRevokeClassObject` on shutdown; the OS reclaims it on exit.
+    /// `None` when no COM activator was registered.
+    com_cookie: RwLock<Option<u32>>,
+    #[cfg(feature = "push-notifications")]
+    push_channel: RwLock<Option<PushNotificationChannel>>,
+}
+
+/// COM activator that receives toast activations from Action Center, including
+/// the cold-start case where Windows launches the exe via the manifest's
+/// `windows.toastNotificationActivation` extension.
+///
+/// Wired up by `init()` when a CLSID is available: the configured one for a
+/// packaged app, or the registered one for an unpackaged app. The class is
+/// registered in the STA of the thread that ran `init`, so COM dispatches the
+/// callback through that thread's message loop. `focus` still goes through
+/// `run_on_main_thread` since `init` is not guaranteed to run on it.
+#[implement(INotificationActivationCallback)]
+struct ToastActivator {
+    plugin: Weak<WindowsPlugin>,
+}
+
+/// Out-of-proc COM activator pattern requires a class factory; `CoRegisterClassObject`
+/// takes an `IUnknown` that must implement `IClassFactory`, not the activator
+/// instance directly. There is no shortcut for the toast activator path.
+#[implement(IClassFactory)]
+struct ToastActivatorFactory {
+    plugin: Weak<WindowsPlugin>,
+}
+
+impl std::fmt::Debug for WindowsPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsPlugin")
+            .field("app_id", &self.app_id)
+            .field("packaged", &self.packaged)
+            .finish_non_exhaustive()
+    }
+}
+
+impl INotificationActivationCallback_Impl for ToastActivator_Impl {
+    fn Activate(
+        &self,
+        _appusermodelid: &PCWSTR,
+        invokedargs: &PCWSTR,
+        data: *const NOTIFICATION_USER_INPUT_DATA,
+        count: u32,
+    ) -> windows::core::Result<()> {
+        let invoked = unsafe { invokedargs.to_string() }.unwrap_or_default();
+        let mut inputs: HashMap<String, String> = HashMap::new();
+        if count > 0 && !data.is_null() {
+            let slice = unsafe { std::slice::from_raw_parts(data, count as usize) };
+            for entry in slice {
+                let k = unsafe { entry.Key.to_string() }.unwrap_or_default();
+                let v = unsafe { entry.Value.to_string() }.unwrap_or_default();
+                if !k.is_empty() {
+                    inputs.insert(k, v);
+                }
+            }
+        }
+
+        let decoded = decode_activation(&invoked, &inputs);
+        if let Some(plugin) = self.plugin.upgrade() {
+            plugin.deliver_or_buffer("actionPerformed", decoded.action);
+            if let Some(click_payload) = decoded.click {
+                (plugin.focus)();
+                plugin.deliver_or_buffer("notificationClicked", click_payload);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IClassFactory_Impl for ToastActivatorFactory_Impl {
+    fn CreateInstance(
+        &self,
+        punkouter: Ref<'_, windows::core::IUnknown>,
+        riid: *const GUID,
+        ppvobject: *mut *mut c_void,
+    ) -> windows::core::Result<()> {
+        if !punkouter.is_null() {
+            return Err(CLASS_E_NOAGGREGATION.into());
+        }
+        let activator = ToastActivator {
+            plugin: self.plugin.clone(),
+        };
+        let interface: INotificationActivationCallback = activator.into();
+        unsafe { interface.query(riid, ppvobject).ok() }
+    }
+
+    fn LockServer(&self, _flock: BOOL) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl WindowsPlugin {
+    fn action_types(&self) -> crate::Result<HashMap<String, ActionType>> {
+        Ok(self
+            .action_types
+            .read()
+            .map_err(|_| crate::Error::Io(std::io::Error::other("Lock poisoned")))?
+            .clone())
+    }
+
+    fn action_types_mut(
+        &self,
+    ) -> crate::Result<std::sync::RwLockWriteGuard<'_, HashMap<String, ActionType>>> {
+        self.action_types
+            .write()
+            .map_err(|_| crate::Error::Io(std::io::Error::other("Lock poisoned")))
+    }
+
+    /// The COM activator receives every activation, the popup's included.
+    fn has_com_activator(&self) -> bool {
+        self.com_cookie.read().is_ok_and(|cookie| cookie.is_some())
+    }
+
+    fn deliver_or_buffer(&self, event: &'static str, payload: serde_json::Value) {
+        self.pending
+            .deliver_or_buffer(event, payload, |payload| self.trigger(event, payload));
+    }
+
+    fn trigger(&self, event: &str, payload: &serde_json::Value) -> bool {
+        crate::listeners::trigger(event, payload.to_string()).unwrap_or_else(|e| {
+            log::error!("Failed to deliver {event}: {e}");
+            false
+        })
+    }
+
+    pub fn drain_pending(&self, event: &str) {
+        self.pending
+            .drain(event, |payload| self.trigger(event, payload));
+    }
+
+    fn open_push_channel(&self, fallback_title: String) -> crate::Result<String> {
+        #[cfg(feature = "push-notifications")]
+        {
+            let channel =
+                PushNotificationChannelManager::CreatePushNotificationChannelForApplicationAsync()?
+                    .get()?;
+            channel.PushNotificationReceived(&TypedEventHandler::new(
+                move |_: Ref<'_, PushNotificationChannel>,
+                      args: Ref<'_, PushNotificationReceivedEventArgs>| {
+                    if let Some(args) = &*args {
+                        deliver_push(args, &fallback_title);
+                    }
+                    Ok(())
+                },
+            ))?;
+            let uri = channel.Uri()?.to_string_lossy();
+            *self
+                .push_channel
+                .write()
+                .map_err(|_| crate::Error::Io(std::io::Error::other("Lock poisoned")))? =
+                Some(channel);
+            Ok(uri)
+        }
+        #[cfg(not(feature = "push-notifications"))]
+        {
+            let _ = fallback_title;
+            Err(crate::Error::Io(std::io::Error::other(
+                "Push notifications feature not enabled",
+            )))
+        }
+    }
+
+    fn close_push_channel(&self) -> crate::Result<()> {
+        #[cfg(feature = "push-notifications")]
+        {
+            if let Some(channel) = self
+                .push_channel
+                .write()
+                .map_err(|_| crate::Error::Io(std::io::Error::other("Lock poisoned")))?
+                .take()
+            {
+                channel.Close()?;
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "push-notifications"))]
+        {
+            Err(crate::Error::Io(std::io::Error::other(
+                "Push notifications feature not enabled",
+            )))
+        }
+    }
+}
+
+/// Forwards a WNS push to listeners in the shape the Linux `UnifiedPush` handler emits.
+/// Toast pushes are left uncancelled so Windows still shows them.
+#[cfg(feature = "push-notifications")]
+fn deliver_push(args: &PushNotificationReceivedEventArgs, fallback_title: &str) {
+    let (title, body, extra) = match args.NotificationType() {
+        Ok(PushNotificationType::Raw) => {
+            let Some(text) = args
+                .RawNotification()
+                .and_then(|raw| raw.Content())
+                .ok()
+                .map(|content| content.to_string_lossy())
+            else {
+                return;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return deliver_notification(
+                    None,
+                    Some(text),
+                    serde_json::json!({}),
+                    fallback_title,
+                );
+            };
+            let text_field = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+            let extra = match value.get("data").or_else(|| value.get("extra")) {
+                Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map.clone()),
+                Some(other) => serde_json::json!({ "_raw": other }),
+                None => serde_json::json!({}),
+            };
+            (
+                text_field("title"),
+                text_field("body").or_else(|| text_field("message")),
+                extra,
+            )
+        }
+        Ok(PushNotificationType::Toast) => {
+            let texts = args
+                .ToastNotification()
+                .and_then(|toast| toast.Content())
+                .and_then(|content| content.GetElementsByTagName(&HSTRING::from("text")))
+                .ok();
+            let text_at = |index| {
+                texts
+                    .as_ref()
+                    .and_then(|texts| texts.GetAt(index).ok())
+                    .and_then(|el| el.InnerText().ok())
+                    .map(|s| s.to_string_lossy())
+            };
+            (text_at(0), text_at(1), serde_json::json!({}))
+        }
+        _ => return,
+    };
+    deliver_notification(title, body, extra, fallback_title);
+}
+
+#[cfg(feature = "push-notifications")]
+fn deliver_notification(
+    title: Option<String>,
+    body: Option<String>,
+    extra: serde_json::Value,
+    fallback_title: &str,
+) {
+    let payload = serde_json::json!({
+        "source": "push",
+        "title": title.unwrap_or_else(|| fallback_title.to_owned()),
+        "body": body,
+        "extra": extra,
+    });
+    if let Err(e) = crate::listeners::trigger("notification", payload.to_string()) {
+        log::warn!("Failed to dispatch push notification to listeners: {e}");
+    }
+}
+
+pub fn init<R: Runtime, C: DeserializeOwned>(
+    app: &AppHandle<R>,
+    _api: PluginApi<R, C>,
+    windows_config: WindowsConfig,
+) -> crate::Result<Notifications<R>> {
+    let app_id = app.config().identifier.clone();
+    let packaged = is_packaged();
+    let activator_clsid = if packaged {
+        windows_config.toast_activator_clsid
+    } else if windows_config.register_unpackaged_activator {
+        match register_unpackaged_activation(
+            app,
+            &app_id,
+            windows_config.toast_activator_clsid.as_deref(),
+        ) {
+            Ok(clsid) => Some(clsid),
+            Err(e) => {
+                log::error!("Failed to register the unpackaged toast activation: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !packaged {
+        // Must be set before any UI so the process AUMID matches the toast's.
+        if let Err(e) = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(&app_id)) }
+        {
+            log::warn!("Failed to set the process AppUserModelID: {e}");
+        }
+    }
+    let notifier = if packaged {
+        ToastNotificationManager::CreateToastNotifier()?
+    } else {
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(&app_id))?
+    };
+
+    let focus_handle = app.clone();
+    let plugin = Arc::new(WindowsPlugin {
+        app_id,
+        packaged,
+        notifier,
+        focus: Box::new(move || crate::focus::focus_app(&focus_handle)),
+        action_types: RwLock::new(HashMap::new()),
+        pending: PendingActivations::default(),
+        com_cookie: RwLock::new(None),
+        #[cfg(feature = "push-notifications")]
+        push_channel: RwLock::new(None),
+    });
+
+    if let Some(clsid_str) = activator_clsid.as_deref() {
+        match register_toast_activator(&plugin, clsid_str) {
+            Ok(cookie) => {
+                // Activations are held back until the plugin state exists.
+                // On failure revoke so the in-process path handles them.
+                if let Err(e) = unsafe { CoResumeClassObjects() } {
+                    log::error!("Failed to resume the toast activator class object: {e}");
+                    if let Err(e) = unsafe { CoRevokeClassObject(cookie) } {
+                        log::error!("Failed to revoke the toast activator class object: {e}");
+                    }
+                } else {
+                    if let Ok(mut slot) = plugin.com_cookie.write() {
+                        *slot = Some(cookie);
+                    }
+                    log::info!("Toast activator registered (clsid={clsid_str}, cookie={cookie})");
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to register toast activator (clsid={clsid_str}): {e}; \
+                     Action Center clicks will fall back to shortcut launch without payload"
+                );
+            }
+        }
+    }
+
+    Ok(Notifications {
+        app: app.clone(),
+        plugin,
+    })
+}
+
+const ACTIVATION_ARGUMENT: &str = "-ToastActivated";
+
+const ACTIVATOR_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x3c8f_2b1e_6d4a_4f7e_9a51_0e7c_d2b4_8f63);
+
+/// The registration Windows App SDK's `AppNotificationManager::Register`
+/// writes for an unpackaged app.
+fn register_unpackaged_activation<R: Runtime>(
+    app: &AppHandle<R>,
+    app_id: &str,
+    configured_clsid: Option<&str>,
+) -> windows::core::Result<String> {
+    let clsid = configured_clsid.map_or_else(
+        || uuid::Uuid::new_v5(&ACTIVATOR_NAMESPACE, app_id.as_bytes()).to_string(),
+        |clsid| clsid.trim_matches(['{', '}']).to_owned(),
+    );
+    parse_clsid(&clsid)?;
+    let braced = format!("{{{clsid}}}");
+    let exe =
+        std::env::current_exe().map_err(|e| windows::core::Error::new(E_FAIL, e.to_string()))?;
+    let display_name = app
+        .config()
+        .product_name
+        .clone()
+        .unwrap_or_else(|| app_id.to_owned());
+
+    let app_key = format!(r"Software\Classes\AppUserModelId\{app_id}");
+    set_user_registry_string(&app_key, Some("DisplayName"), &display_name)?;
+    set_user_registry_string(&app_key, Some("CustomActivator"), &braced)?;
+    set_user_registry_string(
+        &format!(r"Software\Classes\CLSID\{braced}\LocalServer32"),
+        None,
+        &format!("\"{}\" {ACTIVATION_ARGUMENT}", exe.display()),
+    )?;
+    Ok(clsid)
+}
+
+fn set_user_registry_string(
+    subkey: &str,
+    name: Option<&str>,
+    value: &str,
+) -> windows::core::Result<()> {
+    let mut key = HKEY::default();
+    unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(subkey),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &raw mut key,
+            None,
+        )
+    }
+    .ok()?;
+    let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    let name = name.map(HSTRING::from);
+    let written = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ref()
+                .map_or(PCWSTR::null(), |name| PCWSTR(name.as_ptr())),
+            None,
+            REG_SZ,
+            Some(&bytes),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    written.ok()
+}
+
+/// Initialize COM for the current thread (apartment-threaded) and register a
+/// `ToastActivatorFactory` for the given CLSID. Returns the
+/// `CoRegisterClassObject` cookie on success.
+///
+/// `CoInitializeEx` is idempotent for the same apartment model: `S_OK` on
+/// first call, `S_FALSE` on subsequent calls. `RPC_E_CHANGED_MODE` means
+/// another component already initialized this thread as MTA — surfaced as an
+/// error so the caller logs and skips registration.
+fn register_toast_activator(
+    plugin: &Arc<WindowsPlugin>,
+    clsid_str: &str,
+) -> windows::core::Result<u32> {
+    let clsid = parse_clsid(clsid_str)?;
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr != S_OK && hr != S_FALSE {
+        return Err(hr.into());
+    }
+    let factory = ToastActivatorFactory {
+        plugin: Arc::downgrade(plugin),
+    };
+    let factory_interface: IClassFactory = factory.into();
+    unsafe {
+        CoRegisterClassObject(
+            &clsid,
+            &factory_interface,
+            CLSCTX_LOCAL_SERVER,
+            REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
+        )
+    }
+}
+
+impl<R: Runtime> crate::NotificationsBuilder<R> {
+    fn launch_context(&self) -> serde_json::Value {
+        launch_context(
+            self.data.id,
+            self.data.title.as_deref(),
+            self.data.body.as_deref(),
+            self.data.action_type_id.as_deref(),
+            &self.data.extra,
+        )
+    }
+
+    /// Build toast notification XML using DOM API (safer than string concatenation).
+    fn build_toast_xml(
+        &self,
+        action_types: &HashMap<String, ActionType>,
+    ) -> crate::Result<XmlDocument> {
+        let doc = XmlDocument::new()?;
+
+        // Create root <toast>
+        let toast = doc.CreateElement(&HSTRING::from("toast"))?;
+        doc.AppendChild(&toast)?;
+
+        // The COM `Activate` callback only receives the launch string, so the
+        // context must survive a cold start inside it (see `crate::activation`).
+        let launch = self.launch_context();
+        toast.SetAttribute(
+            &HSTRING::from("launch"),
+            &HSTRING::from(launch.to_string().as_str()),
+        )?;
+
+        // Create <visual><binding template="ToastGeneric">
+        let visual = doc.CreateElement(&HSTRING::from("visual"))?;
+        let binding = doc.CreateElement(&HSTRING::from("binding"))?;
+        binding.SetAttribute(&HSTRING::from("template"), &HSTRING::from("ToastGeneric"))?;
+
+        // Add <text> elements for title/body
+        if let Some(title) = &self.data.title {
+            let text = doc.CreateElement(&HSTRING::from("text"))?;
+            text.SetInnerText(&HSTRING::from(title.as_str()))?;
+            binding.AppendChild(&text)?;
+        }
+
+        if let Some(body) = &self.data.body {
+            let text = doc.CreateElement(&HSTRING::from("text"))?;
+            text.SetInnerText(&HSTRING::from(body.as_str()))?;
+            binding.AppendChild(&text)?;
+        }
+
+        // Skip when identical to `body`: WinRT renders each `<text>` on its
+        // own line, so duplicating it just shows the same string twice in the
+        // expanded view (issue #231).
+        if let Some(large_body) = &self.data.large_body
+            && self.data.body.as_ref() != Some(large_body)
+        {
+            let text = doc.CreateElement(&HSTRING::from("text"))?;
+            text.SetInnerText(&HSTRING::from(large_body.as_str()))?;
+            binding.AppendChild(&text)?;
+        }
+
+        // Add icon if specified. Drop silently when the user-supplied string
+        // can't be coerced into a Windows-accepted URI scheme — otherwise the
+        // whole toast falls back to "New notification".
+        if let Some(icon) = &self.data.icon {
+            if let Some(src) = resolve_toast_image_src(&self.app, icon, self.plugin.packaged) {
+                let image = doc.CreateElement(&HSTRING::from("image"))?;
+                image.SetAttribute(
+                    &HSTRING::from("placement"),
+                    &HSTRING::from("appLogoOverride"),
+                )?;
+                image.SetAttribute(&HSTRING::from("src"), &HSTRING::from(src.as_str()))?;
+                binding.AppendChild(&image)?;
+            }
+        }
+
+        // Add attachments as images. Same URI resolution applies.
+        let mut hero_slot_taken = false;
+        for attachment in self.data.attachments.iter() {
+            let Some(src) =
+                resolve_toast_image_src(&self.app, attachment.url().as_str(), self.plugin.packaged)
+            else {
+                continue;
+            };
+            let image = doc.CreateElement(&HSTRING::from("image"))?;
+            if !hero_slot_taken {
+                image.SetAttribute(&HSTRING::from("placement"), &HSTRING::from("hero"))?;
+                hero_slot_taken = true;
+            }
+            image.SetAttribute(&HSTRING::from("src"), &HSTRING::from(src.as_str()))?;
+            binding.AppendChild(&image)?;
+        }
+
+        visual.AppendChild(&binding)?;
+        toast.AppendChild(&visual)?;
+
+        // Add <actions> if action_type_id specified
+        if let Some(action_type_id) = &self.data.action_type_id {
+            if let Some(action_type) = action_types.get(action_type_id) {
+                let actions = doc.CreateElement(&HSTRING::from("actions"))?;
+                for action in action_type.actions() {
+                    let action_el = doc.CreateElement(&HSTRING::from("action"))?;
+                    action_el
+                        .SetAttribute(&HSTRING::from("content"), &HSTRING::from(action.title()))?;
+                    action_el.SetAttribute(
+                        &HSTRING::from("arguments"),
+                        &HSTRING::from(button_arguments(&launch, action.id()).as_str()),
+                    )?;
+                    let activation_type = if action.foreground() {
+                        "foreground"
+                    } else {
+                        "background"
+                    };
+                    action_el.SetAttribute(
+                        &HSTRING::from("activationType"),
+                        &HSTRING::from(activation_type),
+                    )?;
+                    actions.AppendChild(&action_el)?;
+                }
+                toast.AppendChild(&actions)?;
+            }
+        }
+
+        // Add <audio> element for silent or custom sound
+        if self.data.silent {
+            let audio = doc.CreateElement(&HSTRING::from("audio"))?;
+            audio.SetAttribute(&HSTRING::from("silent"), &HSTRING::from("true"))?;
+            toast.AppendChild(&audio)?;
+        } else if let Some(sound) = &self.data.sound {
+            // Toasts only play ms-appx:/ms-resource: files or ms-winsoundevent: names; anything else is dropped.
+            let lower = sound.to_ascii_lowercase();
+            if ["ms-appx:", "ms-resource:", "ms-winsoundevent:"]
+                .iter()
+                .any(|scheme| lower.starts_with(scheme))
+            {
+                let audio = doc.CreateElement(&HSTRING::from("audio"))?;
+                audio.SetAttribute(&HSTRING::from("src"), &HSTRING::from(sound.as_str()))?;
+                toast.AppendChild(&audio)?;
+            } else {
+                log::warn!("Ignoring notification sound {sound:?}: using the default sound");
+            }
+        }
+
+        Ok(doc)
+    }
+
+    pub async fn show(self) -> crate::Result<()> {
+        let action_types = self.plugin.action_types()?;
+        let toast_xml = self.build_toast_xml(&action_types)?;
+
+        let tag = HSTRING::from(self.data.id.to_string());
+        let group = self.data.group.as_ref().map(|g| HSTRING::from(g.as_str()));
+
+        // Check if this is a scheduled notification
+        if let Some(schedule) = &self.data.schedule {
+            let delivery_time = schedule_to_datetime(schedule)?;
+            let scheduled = ScheduledToastNotification::CreateScheduledToastNotification(
+                &toast_xml,
+                delivery_time,
+            )?;
+
+            scheduled.SetTag(&tag)?;
+            if let Some(g) = &group {
+                scheduled.SetGroup(g)?;
+            }
+
+            self.plugin.notifier.AddToSchedule(&scheduled)?;
+        } else {
+            // Immediate notification
+            let toast = ToastNotification::CreateToastNotification(&toast_xml)?;
+            toast.SetTag(&tag)?;
+            if let Some(g) = &group {
+                toast.SetGroup(g)?;
+            }
+
+            toast.Failed(&TypedEventHandler::new(
+                |_: windows::core::Ref<'_, ToastNotification>,
+                 args: windows::core::Ref<'_, ToastFailedEventArgs>| {
+                    if let Some(args) = &*args {
+                        log::error!("Toast failed to display: {:?}", args.ErrorCode());
+                    }
+                    Ok(())
+                },
+            ))?;
+
+            if !self.plugin.has_com_activator() {
+                let plugin = Arc::downgrade(&self.plugin);
+
+                toast.Activated(&TypedEventHandler::new(
+                    move |_: windows::core::Ref<'_, ToastNotification>,
+                          args: windows::core::Ref<'_, windows::core::IInspectable>| {
+                        if let Some(plugin) = plugin.upgrade()
+                            && let Some(inspectable) = &*args
+                            && let Ok(activated) = inspectable.cast::<ToastActivatedEventArgs>()
+                        {
+                            let arguments = activated
+                                .Arguments()
+                                .map(|s| s.to_string_lossy())
+                                .unwrap_or_default();
+                            let decoded = decode_activation(&arguments, &HashMap::new());
+                            plugin.deliver_or_buffer("actionPerformed", decoded.action);
+                            if let Some(click_payload) = decoded.click {
+                                (plugin.focus)();
+                                plugin.deliver_or_buffer("notificationClicked", click_payload);
+                            }
+                        }
+                        Ok(())
+                    },
+                ))?;
+            }
+
+            self.plugin.notifier.Show(&toast)?;
+        }
+
+        // Trigger notification event
+        let payload = serde_json::json!({
+            "id": self.data.id,
+            "title": self.data.title,
+            "body": self.data.body,
+            "actionTypeId": self.data.action_type_id,
+            "extra": self.data.extra,
+        });
+        if let Err(e) = crate::listeners::trigger("notification", payload.to_string()) {
+            log::error!("Failed to trigger notification: {e}");
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert Schedule to Windows DateTime.
+fn schedule_to_datetime(schedule: &Schedule) -> crate::Result<DateTime> {
+    let now = time::OffsetDateTime::now_utc();
+    let unsupported = |what: &str| {
+        crate::Error::Io(std::io::Error::other(format!(
+            "{what} schedules are not supported on Windows; only a single future delivery time is"
+        )))
+    };
+
+    let delivery_time = match schedule {
+        Schedule::At {
+            date, repeating, ..
+        } => {
+            if *repeating {
+                return Err(unsupported("Repeating"));
+            }
+            if *date <= now {
+                return Err(crate::Error::Io(std::io::Error::other(
+                    "Schedule date must be in the future",
+                )));
+            }
+            *date
+        }
+        Schedule::Interval { interval, .. } => {
+            if interval.year.is_some() || interval.month.is_some() || interval.weekday.is_some() {
+                return Err(unsupported("Calendar-matching"));
+            }
+            // Build duration from interval fields
+            let seconds = interval.second.unwrap_or(0) as i64;
+            let minutes = interval.minute.unwrap_or(0) as i64;
+            let hours = interval.hour.unwrap_or(0) as i64;
+            let days = interval.day.unwrap_or(0) as i64;
+            let total_seconds = seconds + minutes * 60 + hours * 3600 + days * 86400;
+            now + time::Duration::seconds(total_seconds)
+        }
+        Schedule::Every { .. } => return Err(unsupported("Repeating")),
+    };
+
+    unix_to_windows_datetime(delivery_time)
+}
+
+/// Convert a Unix timestamp to Windows DateTime (FILETIME).
+fn unix_to_windows_datetime(time: time::OffsetDateTime) -> crate::Result<DateTime> {
+    let ft = FileTime::try_from(time.to_utc())
+        .map_err(|_| crate::Error::Io(std::io::Error::other("Schedule date out of range")))?;
+    let raw: i64 = ft
+        .to_raw()
+        .try_into()
+        .map_err(|_| crate::Error::Io(std::io::Error::other("Schedule date out of range")))?;
+    Ok(DateTime { UniversalTime: raw })
+}
+
+/// Convert Windows DateTime (FILETIME) back to Unix timestamp.
+fn windows_datetime_to_unix(dt: DateTime) -> crate::Result<time::OffsetDateTime> {
+    let raw: u64 = dt
+        .UniversalTime
+        .try_into()
+        .map_err(|_| crate::Error::Io(std::io::Error::other("DateTime out of range")))?;
+    let utc = time::UtcDateTime::try_from(FileTime::new(raw))
+        .map_err(|_| crate::Error::Io(std::io::Error::other("DateTime out of range")))?;
+    Ok(utc.into())
+}
+
+pub struct Notifications<R: Runtime> {
+    #[allow(dead_code)]
+    app: AppHandle<R>,
+    plugin: Arc<WindowsPlugin>,
+}
+
+impl<R: Runtime> Notifications<R> {
+    pub fn builder(&self) -> crate::NotificationsBuilder<R> {
+        crate::NotificationsBuilder::new(self.app.clone(), self.plugin.clone())
+    }
+
+    pub fn drain_pending(&self, event: &str) {
+        self.plugin.drain_pending(event);
+    }
+
+    pub async fn request_permission(&self) -> crate::Result<PermissionState> {
+        // Windows doesn't have a runtime permission prompt like mobile
+        // We can only check the current state
+        self.permission_state().await
+    }
+
+    pub async fn register_for_push_notifications(
+        &self,
+        _vapid: Option<String>,
+    ) -> crate::Result<PushNotificationResponse> {
+        let fallback_title = self
+            .app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| self.plugin.app_id.clone());
+        self.plugin
+            .open_push_channel(fallback_title)
+            .map(PushNotificationResponse::from_token)
+    }
+
+    pub fn unregister_for_push_notifications(&self) -> crate::Result<()> {
+        self.plugin.close_push_channel()
+    }
+
+    pub async fn permission_state(&self) -> crate::Result<PermissionState> {
+        match self.plugin.notifier.Setting()? {
+            NotificationSetting::Enabled => Ok(PermissionState::Granted),
+            NotificationSetting::DisabledForApplication
+            | NotificationSetting::DisabledForUser
+            | NotificationSetting::DisabledByGroupPolicy
+            | NotificationSetting::DisabledByManifest => Ok(PermissionState::Denied),
+            _ => Ok(PermissionState::Prompt),
+        }
+    }
+
+    pub fn register_action_types(&self, types: Vec<ActionType>) -> crate::Result<()> {
+        let mut action_types = self.plugin.action_types_mut()?;
+        for action_type in types {
+            action_types.insert(action_type.id().to_string(), action_type);
+        }
+        Ok(())
+    }
+
+    pub fn remove_active(&self, notifications: Vec<i32>) -> crate::Result<()> {
+        let history = ToastNotificationManager::History()?;
+        let app_id = &self.plugin.app_id;
+
+        // Removal needs the same (tag, group) pair used at show time.
+        let delivered = if self.plugin.packaged {
+            history.GetHistory()?
+        } else {
+            history.GetHistoryWithId(&HSTRING::from(app_id))?
+        };
+        let mut groups: HashMap<String, HSTRING> = HashMap::new();
+        for i in 0..delivered.Size()? {
+            let notification = delivered.GetAt(i)?;
+            let tag = notification.Tag()?.to_string_lossy();
+            groups.insert(tag, notification.Group().unwrap_or_default());
+        }
+
+        for id in notifications {
+            let tag = HSTRING::from(id.to_string());
+            let group = groups.get(&id.to_string()).cloned().unwrap_or_default();
+            let res = if self.plugin.packaged {
+                history.RemoveGroupedTag(&tag, &group)
+            } else {
+                history.RemoveGroupedTagWithId(&tag, &group, &HSTRING::from(app_id))
+            };
+            if let Err(e) = res {
+                log::error!("Failed to remove notification {id}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn active(&self) -> crate::Result<Vec<ActiveNotification>> {
+        let history = ToastNotificationManager::History()?;
+        let notifications = if self.plugin.packaged {
+            history.GetHistory()?
+        } else {
+            history.GetHistoryWithId(&HSTRING::from(&self.plugin.app_id))?
+        };
+
+        let mut result = Vec::new();
+        for i in 0..notifications.Size()? {
+            let notification = notifications.GetAt(i)?;
+            let tag = notification.Tag()?.to_string_lossy();
+            let id = tag.parse::<i32>().unwrap_or(0);
+            let group = notification.Group().ok().map(|s| s.to_string_lossy());
+
+            // Extract title/body from XML content
+            let (title, body) = if let Ok(content) = notification.Content() {
+                let text_elements = content.GetElementsByTagName(&HSTRING::from("text"))?;
+                let title = text_elements
+                    .GetAt(0)
+                    .ok()
+                    .and_then(|el| el.InnerText().ok())
+                    .map(|s| s.to_string_lossy());
+                let body = text_elements
+                    .GetAt(1)
+                    .ok()
+                    .and_then(|el| el.InnerText().ok())
+                    .map(|s| s.to_string_lossy());
+                (title, body)
+            } else {
+                (None, None)
+            };
+
+            result.push(ActiveNotification {
+                id,
+                tag: Some(tag),
+                title,
+                body,
+                group,
+                group_summary: false,
+                data: HashMap::new(),
+                extra: HashMap::new(),
+                attachments: Vec::new(),
+                action_type_id: None,
+                schedule: None,
+                sound: None,
+            });
+        }
+
+        Ok(result)
+    }
+
+    pub fn remove_all_active(&self) -> crate::Result<()> {
+        let history = ToastNotificationManager::History()?;
+        if self.plugin.packaged {
+            history.Clear()?;
+        } else {
+            history.ClearWithId(&HSTRING::from(&self.plugin.app_id))?;
+        }
+        Ok(())
+    }
+
+    pub async fn pending(&self) -> crate::Result<Vec<PendingNotification>> {
+        let scheduled = self.plugin.notifier.GetScheduledToastNotifications()?;
+        let mut result = Vec::new();
+
+        for i in 0..scheduled.Size()? {
+            let notification = scheduled.GetAt(i)?;
+            let tag = notification.Tag()?.to_string_lossy();
+            let id = tag.parse::<i32>().unwrap_or(0);
+
+            let (title, body) = if let Ok(content) = notification.Content() {
+                let text_elements = content.GetElementsByTagName(&HSTRING::from("text"))?;
+                let title = text_elements
+                    .GetAt(0)
+                    .ok()
+                    .and_then(|el| el.InnerText().ok())
+                    .map(|s| s.to_string_lossy());
+                let body = text_elements
+                    .GetAt(1)
+                    .ok()
+                    .and_then(|el| el.InnerText().ok())
+                    .map(|s| s.to_string_lossy());
+                (title, body)
+            } else {
+                (None, None)
+            };
+
+            // Convert Windows DateTime back to Schedule::At
+            let schedule = notification.DeliveryTime().ok().and_then(|dt| {
+                windows_datetime_to_unix(dt).ok().map(|date| Schedule::At {
+                    date,
+                    repeating: false,
+                    allow_while_idle: false,
+                })
+            });
+
+            // PendingNotification requires schedule (not Option), skip if we can't extract it
+            if let Some(schedule) = schedule {
+                result.push(PendingNotification {
+                    id,
+                    title,
+                    body,
+                    schedule,
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn cancel(&self, notifications: Vec<i32>) -> crate::Result<()> {
+        let scheduled = self.plugin.notifier.GetScheduledToastNotifications()?;
+        let ids_to_cancel: std::collections::HashSet<_> = notifications.into_iter().collect();
+
+        for i in 0..scheduled.Size()? {
+            if let Ok(notification) = scheduled.GetAt(i) {
+                if let Ok(tag) = notification.Tag() {
+                    if let Ok(id) = tag.to_string_lossy().parse::<i32>() {
+                        if ids_to_cancel.contains(&id) {
+                            if let Err(e) = self.plugin.notifier.RemoveFromSchedule(&notification) {
+                                log::error!("Failed to cancel notification {id}: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cancel_all(&self) -> crate::Result<()> {
+        let scheduled = self.plugin.notifier.GetScheduledToastNotifications()?;
+        for i in 0..scheduled.Size()? {
+            if let Ok(notification) = scheduled.GetAt(i) {
+                if let Err(e) = self.plugin.notifier.RemoveFromSchedule(&notification) {
+                    log::error!("Failed to cancel scheduled notification: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub const fn set_click_listener_active(&self, _active: bool) -> crate::Result<()> {
+        Ok(())
+    }
+
+    pub const fn set_action_listener_active(&self, _active: bool) -> crate::Result<()> {
+        Ok(())
+    }
+
+    pub const fn set_push_message_listener_active(&self, _active: bool) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn is_ignoring_battery_optimizations(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn push_transport(&self) -> crate::Result<crate::models::PushTransport> {
+        Ok(crate::models::PushTransport::default())
+    }
+
+    pub fn request_ignore_battery_optimizations(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn can_schedule_exact_alarms(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn request_schedule_exact_alarms(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Create a notification channel (not supported on Windows).
+    pub fn create_channel(&self, _channel: crate::Channel) -> crate::Result<()> {
+        Err(crate::Error::Io(std::io::Error::other(
+            "Notification channels are not supported on Windows",
+        )))
+    }
+
+    /// Delete a notification channel (not supported on Windows).
+    pub fn delete_channel(&self, _id: impl Into<String>) -> crate::Result<()> {
+        Err(crate::Error::Io(std::io::Error::other(
+            "Notification channels are not supported on Windows",
+        )))
+    }
+
+    /// List notification channels (not supported on Windows).
+    pub fn list_channels(&self) -> crate::Result<Vec<crate::Channel>> {
+        Err(crate::Error::Io(std::io::Error::other(
+            "Notification channels are not supported on Windows",
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PowerShell App User Model ID - always available on Windows.
+    const POWERSHELL_APP_ID: &str =
+        "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    // ==================== Time Conversion Tests ====================
+
+    /// Windows FILETIME epoch (1601-01-01) offset from Unix epoch (1970-01-01),
+    /// in 100-nanosecond ticks. Used only as a test reference value.
+    const WINDOWS_EPOCH_OFFSET_TICKS: i128 = 116_444_736_000_000_000;
+
+    #[test]
+    fn test_unix_to_windows_datetime_epoch() {
+        let result = unix_to_windows_datetime(time::OffsetDateTime::UNIX_EPOCH)
+            .expect("Failed to convert Unix epoch");
+        assert_eq!(result.UniversalTime as i128, WINDOWS_EPOCH_OFFSET_TICKS);
+    }
+
+    #[test]
+    fn test_unix_to_windows_datetime_known_date() {
+        let date = time::macros::datetime!(2000-01-01 00:00:00 UTC);
+        let result = unix_to_windows_datetime(date).expect("Failed to convert known date");
+
+        let unix_nanos = 946_684_800i128 * 1_000_000_000;
+        let expected = (unix_nanos / 100) + WINDOWS_EPOCH_OFFSET_TICKS;
+        assert_eq!(result.UniversalTime as i128, expected);
+    }
+
+    #[test]
+    fn test_windows_datetime_roundtrip() {
+        let original = time::macros::datetime!(2024-06-15 14:30:45 UTC);
+        let windows_dt =
+            unix_to_windows_datetime(original).expect("Failed to convert to Windows datetime");
+        let roundtrip =
+            windows_datetime_to_unix(windows_dt).expect("Failed to convert back to Unix");
+
+        let diff = (original - roundtrip).whole_nanoseconds().abs();
+        assert!(diff < 100, "Roundtrip diff: {}ns", diff);
+    }
+
+    #[test]
+    fn test_schedule_at_conversion() {
+        let target = time::macros::datetime!(2099-12-25 10:00:00 UTC);
+        let schedule = Schedule::At {
+            date: target,
+            repeating: false,
+            allow_while_idle: false,
+        };
+
+        let result = schedule_to_datetime(&schedule).expect("Failed to convert schedule");
+        let back = windows_datetime_to_unix(result).expect("Failed to convert back");
+        assert!((target - back).whole_nanoseconds().abs() < 100);
+    }
+
+    #[test]
+    fn test_schedule_interval() {
+        let schedule = Schedule::Interval {
+            interval: ScheduleInterval {
+                year: None,
+                month: None,
+                day: Some(1),
+                weekday: None,
+                hour: Some(2),
+                minute: Some(30),
+                second: Some(45),
+            },
+            allow_while_idle: false,
+        };
+
+        let before = time::OffsetDateTime::now_utc();
+        let result = schedule_to_datetime(&schedule).expect("Failed to convert interval schedule");
+        let converted = windows_datetime_to_unix(result).expect("Failed to convert back");
+
+        let expected = 86400 + 7200 + 1800 + 45; // 1d + 2h + 30m + 45s
+        let actual = (converted - before).whole_seconds();
+        assert!((actual - expected).abs() <= 2);
+    }
+
+    #[test]
+    fn test_schedule_rejects_repeating_and_past() {
+        let past = Schedule::At {
+            date: time::macros::datetime!(2000-01-01 00:00:00 UTC),
+            repeating: false,
+            allow_while_idle: false,
+        };
+        assert!(schedule_to_datetime(&past).is_err());
+
+        let repeating = Schedule::At {
+            date: time::macros::datetime!(2099-01-01 00:00:00 UTC),
+            repeating: true,
+            allow_while_idle: false,
+        };
+        assert!(schedule_to_datetime(&repeating).is_err());
+
+        let every = Schedule::Every {
+            interval: ScheduleEvery::Day,
+            count: 1,
+            allow_while_idle: false,
+        };
+        assert!(schedule_to_datetime(&every).is_err());
+
+        let calendar = Schedule::Interval {
+            interval: ScheduleInterval {
+                month: Some(1),
+                ..ScheduleInterval::default()
+            },
+            allow_while_idle: false,
+        };
+        assert!(schedule_to_datetime(&calendar).is_err());
+    }
+
+    #[test]
+    fn test_unc_paths_are_detected() {
+        for unc in [
+            r"\\server\share\a.png",
+            "//server/share/a.png",
+            "file://server/share/a.png",
+        ] {
+            assert!(is_unc(&unc.to_ascii_lowercase()), "{unc}");
+        }
+        for local in [r"C:\a.png", "file:///C:/a.png", "/a.png", "https://x/a.png"] {
+            assert!(!is_unc(&local.to_ascii_lowercase()), "{local}");
+        }
+    }
+
+    // ==================== Toast Notifier Tests ====================
+
+    #[test]
+    fn test_toast_notifier_creation() {
+        let result =
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(POWERSHELL_APP_ID));
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    // ==================== XML Building Tests ====================
+
+    #[test]
+    fn test_xml_document_creation() {
+        assert!(XmlDocument::new().is_ok());
+    }
+
+    #[test]
+    fn test_toast_xml_structure() {
+        let doc = XmlDocument::new().expect("Failed to create XmlDocument");
+
+        let toast = doc
+            .CreateElement(&HSTRING::from("toast"))
+            .expect("Failed to create toast element");
+        doc.AppendChild(&toast).expect("Failed to append toast");
+
+        let visual = doc
+            .CreateElement(&HSTRING::from("visual"))
+            .expect("Failed to create visual element");
+        let binding = doc
+            .CreateElement(&HSTRING::from("binding"))
+            .expect("Failed to create binding element");
+        binding
+            .SetAttribute(&HSTRING::from("template"), &HSTRING::from("ToastGeneric"))
+            .expect("Failed to set template attribute");
+
+        let text = doc
+            .CreateElement(&HSTRING::from("text"))
+            .expect("Failed to create text element");
+        text.SetInnerText(&HSTRING::from("Test Title"))
+            .expect("Failed to set text content");
+        binding
+            .AppendChild(&text)
+            .expect("Failed to append text to binding");
+        visual
+            .AppendChild(&binding)
+            .expect("Failed to append binding to visual");
+        toast
+            .AppendChild(&visual)
+            .expect("Failed to append visual to toast");
+
+        let xml = doc.GetXml().expect("Failed to get XML").to_string_lossy();
+        assert!(
+            xml.contains("toast") && xml.contains("ToastGeneric") && xml.contains("Test Title")
+        );
+    }
+
+    #[test]
+    fn test_toast_xml_with_actions() {
+        let doc = XmlDocument::new().expect("Failed to create XmlDocument");
+        let toast = doc
+            .CreateElement(&HSTRING::from("toast"))
+            .expect("Failed to create toast element");
+        doc.AppendChild(&toast).expect("Failed to append toast");
+
+        let actions = doc
+            .CreateElement(&HSTRING::from("actions"))
+            .expect("Failed to create actions element");
+        let action = doc
+            .CreateElement(&HSTRING::from("action"))
+            .expect("Failed to create action element");
+        action
+            .SetAttribute(&HSTRING::from("content"), &HSTRING::from("Accept"))
+            .expect("Failed to set content attribute");
+        action
+            .SetAttribute(&HSTRING::from("arguments"), &HSTRING::from("accept"))
+            .expect("Failed to set arguments attribute");
+        actions
+            .AppendChild(&action)
+            .expect("Failed to append action");
+        toast
+            .AppendChild(&actions)
+            .expect("Failed to append actions");
+
+        let xml = doc.GetXml().expect("Failed to get XML").to_string_lossy();
+        assert!(xml.contains("actions") && xml.contains("Accept"));
+    }
+
+    #[test]
+    fn test_toast_xml_silent() {
+        let doc = XmlDocument::new().expect("Failed to create XmlDocument");
+        let toast = doc
+            .CreateElement(&HSTRING::from("toast"))
+            .expect("Failed to create toast element");
+        doc.AppendChild(&toast).expect("Failed to append toast");
+
+        let audio = doc
+            .CreateElement(&HSTRING::from("audio"))
+            .expect("Failed to create audio element");
+        audio
+            .SetAttribute(&HSTRING::from("silent"), &HSTRING::from("true"))
+            .expect("Failed to set silent attribute");
+        toast.AppendChild(&audio).expect("Failed to append audio");
+
+        assert!(
+            doc.GetXml()
+                .expect("Failed to get XML")
+                .to_string_lossy()
+                .contains("silent")
+        );
+    }
+
+    // ==================== Action Types Tests ====================
+
+    #[test]
+    fn test_action_types_storage() {
+        let types: RwLock<HashMap<String, ActionType>> = RwLock::new(HashMap::new());
+        let action_type = ActionType::new("test", vec![Action::new("btn", "Button", false)]);
+
+        types
+            .write()
+            .expect("RwLock poisoned")
+            .insert("test".to_string(), action_type);
+
+        let read = types.read().expect("RwLock poisoned");
+        assert!(read.contains_key("test"));
+        assert_eq!(read.get("test").expect("Key not found").actions().len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_action_types() {
+        let types: RwLock<HashMap<String, ActionType>> = RwLock::new(HashMap::new());
+
+        {
+            let mut w = types.write().expect("RwLock poisoned");
+            w.insert(
+                "confirm".to_string(),
+                ActionType::new(
+                    "confirm",
+                    vec![
+                        Action::new("yes", "Yes", true),
+                        Action::new("no", "No", false),
+                    ],
+                ),
+            );
+            w.insert(
+                "reply".to_string(),
+                ActionType::new("reply", vec![Action::new("reply", "Reply", true)]),
+            );
+        }
+
+        let r = types.read().expect("RwLock poisoned");
+        assert_eq!(r.len(), 2);
+        assert!(r.contains_key("confirm") && r.contains_key("reply"));
+    }
+}

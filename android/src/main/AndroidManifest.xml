@@ -1,8 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <queries>
+        <intent>
+            <action android:name="org.unifiedpush.android.distributor.REGISTER" />
+        </intent>
+    </queries>
+
     <application>
-        <receiver android:name="app.tauri.notification.TimedNotificationPublisher" android:exported="true" />
+        <receiver android:name="app.tauri.notification.TimedNotificationPublisher" android:exported="false" />
         <receiver android:name="app.tauri.notification.NotificationDismissReceiver" android:exported="false" />
+        <receiver android:name="app.tauri.notification.NotificationActionReceiver" android:exported="false" />
         <receiver
             android:name="app.tauri.notification.LocalNotificationRestoreReceiver"
             android:directBootAware="true"
@@ -10,32 +19,27 @@
             <intent-filter>
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 
+        <!-- UnifiedPush connector push service. The connector library's
+             internal MessagingReceiverImpl receives distributor broadcasts
+             and forwards them to this service, so no BroadcastReceiver is
+             declared for the connector actions. -->
         <service
-            android:name="app.tauri.notification.TauriFirebaseMessagingService"
+            android:name="app.tauri.notification.UnifiedPushReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
             </intent-filter>
         </service>
 
-        <receiver
-            android:name="app.tauri.notification.TauriUnifiedPushMessagingService"
-            android:exported="true"
-            android:enabled="${unifiedPushReceiverEnabled}">
-            <intent-filter>
-                <action android:name="org.unifiedpush.android.connector.MESSAGE"/>
-                <action android:name="org.unifiedpush.android.connector.UNREGISTERED"/>
-                <action android:name="org.unifiedpush.android.connector.NEW_ENDPOINT"/>
-                <action android:name="org.unifiedpush.android.connector.REGISTRATION_FAILED" />
-                <action android:name="org.unifiedpush.android.connector.TEMP_UNAVAILABLE" />
-            </intent-filter>
-        </receiver>
     </application>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
 </manifest>

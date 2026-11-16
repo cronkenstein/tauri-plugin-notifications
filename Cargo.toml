@@ -1,25 +1,27 @@
 [package]
 name = "tauri-plugin-notifications"
-version = "0.4.3"
+version = "0.5.0"
 authors = ["You"]
 description = "A Tauri v2 plugin for sending notifications on desktop and mobile platforms with support for system notifications and push delivery via FCM, APNs, and UnifiedPush."
-edition = "2021"
-rust-version = "1.77.2"
+edition = "2024"
+rust-version = "1.90"
 exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
 links = "tauri-plugin-notifications"
 license = "MIT"
 repository = "https://github.com/Choochmeque/tauri-plugin-notifications"
+categories = ["api-bindings", "gui", "os"]
+keywords = ["tauri", "notifications", "push-notifications", "toast", "desktop"]
 
 [features]
 default = ["notify-rust"]
-push-notifications = []
+push-notifications = ["dep:zbus", "dep:tokio", "dep:uuid"]
 unified-push = []
 notify-rust = ["dep:notify-rust"]
 
 [dependencies]
-tauri = { version = "2.8.2" }
+tauri = { version = "2", default-features = false }
 serde = "1.0"
-serde_json = "1"
+serde_json = "1.0"
 serde_repr = "0.1"
 thiserror = "2"
 log = "0.4"
@@ -28,24 +30,56 @@ time = { version = "0.3", features = ["serde", "parsing", "formatting"] }
 url = { version = "2", features = ["serde"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-tauri = { version = "2.8.2", features = ["wry"] }
+tauri = { version = "2", features = ["wry"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 swift-bridge = { version = "0.1", features = ["async"] }
 
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# notify-rust is the only desktop backend on Linux (no native impl), so it's
+# always pulled in there. On macOS/Windows it's an opt-in alternative to the
+# native backends, gated by the `notify-rust` feature.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 notify-rust = { version = "4.11", optional = true }
 
-[target.'cfg(windows)'.dependencies]
-tauri-winrt-notification = "0.7"
+# UnifiedPush stack — only relevant on desktop Linux, kept optional so non-Linux
+# builds never pull in the zbus/tokio/uuid crates.
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
+notify-rust = "4.11"
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "time"], optional = true }
+uuid = { version = "1", default-features = false, features = ["v4", "fast-rng"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "ApplicationModel",
+    "Data_Xml_Dom",
+    "Foundation",
+    "Networking_PushNotifications",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Notifications",
+    "Win32_UI_Shell",
+] }
+# The `#[implement]` macro from `windows::core::implement` emits `::windows_core::*`
+# absolute paths, so `windows-core` must be a direct dependency, not just
+# transitive through `windows`.
+windows-core = "0.61"
+# Used to parse user-supplied CLSID strings (accepts braced, unbraced, and
+# hyphen-less forms) before converting to `windows::core::GUID` via raw bits,
+# and to derive an unpackaged app's activator CLSID from its identifier.
+uuid = { version = "1", default-features = false, features = ["v5"] }
+nt-time = "0.15"
 
 [build-dependencies]
-tauri-plugin = { version = "2.4.0", features = ["build"] }
+tauri-plugin = { version = "2", features = ["build"] }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 swift-bridge-build = "0.1"
 
 [dev-dependencies]
 color-backtrace = "0.7"
-ctor = "0.6"
+ctor = "1.0"
 maplit = "1"

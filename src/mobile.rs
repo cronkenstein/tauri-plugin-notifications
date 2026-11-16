@@ -1,10 +1,15 @@
+// Async on every target for a uniform API; some platform branches never await.
+
 use serde::de::DeserializeOwned;
 use tauri::{
-    plugin::{PermissionState, PluginApi, PluginHandle},
     AppHandle, Runtime,
+    plugin::{PermissionState, PluginApi, PluginHandle},
 };
 
-use crate::models::*;
+use crate::models::{
+    ActionType, ActiveNotification, Channel, PendingNotification, PermissionResponse,
+    PushNotificationResponse,
+};
 
 use std::collections::HashMap;
 
@@ -15,6 +20,8 @@ const PLUGIN_IDENTIFIER: &str = "app.tauri.notification";
 tauri::ios_plugin_binding!(init_plugin_notification);
 
 // initializes the Kotlin or Swift plugin classes
+// `PluginApi` is consumed by the framework's register helpers.
+#[allow(clippy::needless_pass_by_value)]
 pub fn init<R: Runtime, C: DeserializeOwned>(
     _app: &AppHandle<R>,
     api: PluginApi<R, C>,
@@ -54,16 +61,61 @@ impl<R: Runtime> Notifications<R> {
             .map_err(Into::into)
     }
 
-    pub async fn register_for_push_notifications(&self) -> crate::Result<String> {
+    #[allow(clippy::unused_async)]
+    pub async fn register_for_push_notifications(
+        &self,
+        vapid: Option<String>,
+        provider: Option<crate::models::PushProvider>,
+        embedded_gateway_url: Option<String>,
+        user_id: Option<String>,
+        device_id: Option<String>,
+    ) -> crate::Result<PushNotificationResponse> {
         #[cfg(feature = "push-notifications")]
         {
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct RegisterArgs {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                vapid: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                provider: Option<crate::models::PushProvider>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                embedded_gateway_url: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                user_id: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                device_id: Option<String>,
+            }
             self.0
                 .run_mobile_plugin_async::<PushNotificationResponse>(
                     "registerForPushNotifications",
-                    (),
+                    RegisterArgs {
+                        vapid,
+                        provider,
+                        embedded_gateway_url,
+                        user_id,
+                        device_id,
+                    },
                 )
                 .await
-                .map(|r| r.device_token)
+                .map_err(Into::into)
+        }
+        #[cfg(not(feature = "push-notifications"))]
+        {
+            let _ = (vapid, provider, embedded_gateway_url, user_id, device_id);
+            Err(crate::Error::Io(std::io::Error::other(
+                "Push notifications feature is not enabled",
+            )))
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn unregister_for_push_notifications(&self) -> crate::Result<()> {
+        #[cfg(feature = "push-notifications")]
+        {
+            self.0
+                .run_mobile_plugin_async::<()>("unregisterForPushNotifications", ())
+                .await
                 .map_err(Into::into)
         }
         #[cfg(not(feature = "push-notifications"))]
@@ -74,19 +126,50 @@ impl<R: Runtime> Notifications<R> {
         }
     }
 
-    pub fn unregister_for_push_notifications(&self) -> crate::Result<()> {
-        #[cfg(feature = "push-notifications")]
-        {
-            self.0
-                .run_mobile_plugin::<()>("unregisterForPushNotifications", ())
-                .map_err(Into::into)
+    /// Remove one Android subscription without affecting other accounts.
+    ///
+    /// # Errors
+    ///
+    /// When Android cannot unregister the subscription.
+    #[cfg(all(target_os = "android", feature = "push-notifications"))]
+    pub async fn unregister_push_instance(&self, instance: &str) -> crate::Result<()> {
+        #[derive(serde::Serialize)]
+        struct Args<'a> {
+            instance: &'a str,
         }
-        #[cfg(not(feature = "push-notifications"))]
-        {
-            Err(crate::Error::Io(std::io::Error::other(
-                "Push notifications feature is not enabled",
-            )))
-        }
+        self.0
+            .run_mobile_plugin_async::<()>("unregisterPushInstance", Args { instance })
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(all(target_os = "android", feature = "push-notifications"))]
+    pub async fn list_distributors(&self) -> crate::Result<Vec<String>> {
+        self.0
+            .run_mobile_plugin_async::<crate::models::DistributorsResponse>("listDistributors", ())
+            .await
+            .map(|r| r.distributors)
+            .map_err(Into::into)
+    }
+
+    #[cfg(all(target_os = "android", feature = "push-notifications"))]
+    pub async fn set_distributor(&self, name: String) -> crate::Result<()> {
+        let mut args = HashMap::new();
+        args.insert("distributor", name);
+        self.0
+            .run_mobile_plugin_async::<()>("setDistributor", args)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(all(target_os = "android", feature = "push-notifications"))]
+    pub async fn set_token(&self, token: String) -> crate::Result<()> {
+        let mut args = HashMap::new();
+        args.insert("token", token);
+        self.0
+            .run_mobile_plugin_async::<()>("setToken", args)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn register_for_unified_push(&self) -> crate::Result<serde_json::Value> {
@@ -231,15 +314,16 @@ impl<R: Runtime> Notifications<R> {
             .map_err(Into::into)
     }
 
-    pub fn register_action_types(&self, types: Vec<ActionType>) -> crate::Result<()> {
+    pub async fn register_action_types(&self, types: Vec<ActionType>) -> crate::Result<()> {
         let mut args = HashMap::new();
         args.insert("types", types);
         self.0
-            .run_mobile_plugin("registerActionTypes", args)
+            .run_mobile_plugin_async::<()>("registerActionTypes", args)
+            .await
             .map_err(Into::into)
     }
 
-    pub fn remove_active(&self, notifications: Vec<i32>) -> crate::Result<()> {
+    pub async fn remove_active(&self, notifications: Vec<i32>) -> crate::Result<()> {
         let mut args = HashMap::new();
         args.insert(
             "notifications",
@@ -253,7 +337,8 @@ impl<R: Runtime> Notifications<R> {
                 .collect::<Vec<HashMap<&str, i32>>>(),
         );
         self.0
-            .run_mobile_plugin("removeActive", args)
+            .run_mobile_plugin_async::<()>("removeActive", args)
+            .await
             .map_err(Into::into)
     }
 
@@ -264,9 +349,10 @@ impl<R: Runtime> Notifications<R> {
             .map_err(Into::into)
     }
 
-    pub fn remove_all_active(&self) -> crate::Result<()> {
+    pub async fn remove_all_active(&self) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin("removeActive", ())
+            .run_mobile_plugin_async::<()>("removeActive", ())
+            .await
             .map_err(Into::into)
     }
 
@@ -278,25 +364,31 @@ impl<R: Runtime> Notifications<R> {
     }
 
     /// Cancel pending notifications.
-    pub fn cancel(&self, notifications: Vec<i32>) -> crate::Result<()> {
+    pub async fn cancel(&self, notifications: Vec<i32>) -> crate::Result<()> {
         let mut args = HashMap::new();
         args.insert("notifications", notifications);
-        self.0.run_mobile_plugin("cancel", args).map_err(Into::into)
-    }
-
-    /// Cancel all pending notifications.
-    pub fn cancel_all(&self) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin("cancelAll", ())
+            .run_mobile_plugin_async::<()>("cancel", args)
+            .await
             .map_err(Into::into)
     }
 
-    #[allow(unused_variables)]
-    pub fn create_channel(&self, channel: Channel) -> crate::Result<()> {
+    /// Cancel all pending notifications.
+    pub async fn cancel_all(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin_async::<()>("cancelAll", ())
+            .await
+            .map_err(Into::into)
+    }
+
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[allow(clippy::unused_async)]
+    pub async fn create_channel(&self, channel: Channel) -> crate::Result<()> {
         #[cfg(target_os = "android")]
         return self
             .0
-            .run_mobile_plugin("createChannel", channel)
+            .run_mobile_plugin_async::<()>("createChannel", channel)
+            .await
             .map_err(Into::into);
         #[cfg(target_os = "ios")]
         return Err(crate::Error::Io(std::io::Error::other(
@@ -304,14 +396,16 @@ impl<R: Runtime> Notifications<R> {
         )));
     }
 
-    #[allow(unused_variables)]
-    pub fn delete_channel(&self, id: impl Into<String>) -> crate::Result<()> {
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
+    #[allow(clippy::unused_async)]
+    pub async fn delete_channel(&self, id: impl Into<String> + Send) -> crate::Result<()> {
         #[cfg(target_os = "android")]
         {
             let mut args = HashMap::new();
             args.insert("id", id.into());
             self.0
-                .run_mobile_plugin("deleteChannel", args)
+                .run_mobile_plugin_async::<()>("deleteChannel", args)
+                .await
                 .map_err(Into::into)
         }
         #[cfg(target_os = "ios")]
@@ -320,11 +414,13 @@ impl<R: Runtime> Notifications<R> {
         )));
     }
 
-    pub fn list_channels(&self) -> crate::Result<Vec<Channel>> {
+    #[allow(clippy::unused_async)]
+    pub async fn list_channels(&self) -> crate::Result<Vec<Channel>> {
         #[cfg(target_os = "android")]
         return self
             .0
-            .run_mobile_plugin("listChannels", ())
+            .run_mobile_plugin_async("listChannels", ())
+            .await
             .map_err(Into::into);
         #[cfg(target_os = "ios")]
         return Err(crate::Error::Io(std::io::Error::other(
@@ -332,11 +428,120 @@ impl<R: Runtime> Notifications<R> {
         )));
     }
 
-    pub fn set_click_listener_active(&self, active: bool) -> crate::Result<()> {
+    /// Set click listener active state.
+    /// Used internally to track if JS listener is registered.
+    pub async fn set_click_listener_active(&self, active: bool) -> crate::Result<()> {
         let mut args = HashMap::new();
         args.insert("active", active);
         self.0
-            .run_mobile_plugin("setClickListenerActive", args)
+            .run_mobile_plugin_async::<()>("setClickListenerActive", args)
+            .await
             .map_err(Into::into)
+    }
+
+    /// Set action listener active state.
+    /// Used internally to queue action results until JS is ready.
+    pub async fn set_action_listener_active(&self, active: bool) -> crate::Result<()> {
+        let mut args = HashMap::new();
+        args.insert("active", active);
+        self.0
+            .run_mobile_plugin_async::<()>("setActionListenerActive", args)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Set push-message listener active state.
+    /// Until JS attaches, incoming push messages fall back to a native
+    /// notification instead of being emitted into the void.
+    pub async fn set_push_message_listener_active(&self, active: bool) -> crate::Result<()> {
+        let mut args = HashMap::new();
+        args.insert("active", active);
+        self.0
+            .run_mobile_plugin_async::<()>("setPushMessageListenerActive", args)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn is_ignoring_battery_optimizations(&self) -> crate::Result<bool> {
+        #[cfg(all(target_os = "android", feature = "push-notifications"))]
+        {
+            self.0
+                .run_mobile_plugin_async::<crate::models::BatteryOptimizationResponse>(
+                    "isIgnoringBatteryOptimizations",
+                    (),
+                )
+                .await
+                .map(|r| r.ignoring)
+                .map_err(Into::into)
+        }
+        #[cfg(not(all(target_os = "android", feature = "push-notifications")))]
+        {
+            Ok(true)
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn request_ignore_battery_optimizations(&self) -> crate::Result<()> {
+        #[cfg(all(target_os = "android", feature = "push-notifications"))]
+        {
+            self.0
+                .run_mobile_plugin_async::<()>("requestIgnoreBatteryOptimizations", ())
+                .await
+                .map_err(Into::into)
+        }
+        #[cfg(not(all(target_os = "android", feature = "push-notifications")))]
+        {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn can_schedule_exact_alarms(&self) -> crate::Result<bool> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin_async::<crate::models::ExactAlarmResponse>(
+                    "canScheduleExactAlarms",
+                    (),
+                )
+                .await
+                .map(|r| r.allowed)
+                .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(true)
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn request_schedule_exact_alarms(&self) -> crate::Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin_async::<()>("requestScheduleExactAlarms", ())
+                .await
+                .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    pub async fn push_transport(&self) -> crate::Result<crate::models::PushTransport> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin_async("pushTransport", ())
+                .await
+                .map_err(Into::into)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(crate::models::PushTransport::default())
+        }
     }
 }

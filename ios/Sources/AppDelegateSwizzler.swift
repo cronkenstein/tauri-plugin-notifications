@@ -7,103 +7,135 @@ import ObjectiveC.runtime
 enum AppDelegateSwizzler {
   static weak var plugin: NotificationPlugin?
 
+  private static var originalIMPs: [Selector: IMP] = [:]
+  private static var swizzled = false
+  // Resetting `delegate` makes UIKit release the delegate UIApplicationMain created.
+  private static var retainedDelegate: UIApplicationDelegate?
+
+  /// Safe to call repeatedly: the app delegate may not be set yet the first time.
   static func swizzlePushCallbacks() {
-    guard let app = UIApplication.shared as UIApplication?,
-          let delegate = app.delegate else { return }
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { swizzlePushCallbacks() }
+      return
+    }
+    guard !swizzled else { return }
+    guard let delegate = UIApplication.shared.delegate else { return }
+    let cls: AnyClass = type(of: delegate)
 
-    // didRegisterForRemoteNotificationsWithDeviceToken
-    swizzle(
-      type(of: delegate),
-      #selector(UIApplicationDelegate.application(_:didRegisterForRemoteNotificationsWithDeviceToken:)),
-      #selector(PushForwarder.ta_application(_:didRegisterForRemoteNotificationsWithDeviceToken:))
-    )
+    let installed = [
+      install(
+        cls,
+        #selector(UIApplicationDelegate.application(_:didRegisterForRemoteNotificationsWithDeviceToken:)),
+        #selector(PushForwarder.ta_application(_:didRegisterForRemoteNotificationsWithDeviceToken:))
+      ),
+      install(
+        cls,
+        #selector(UIApplicationDelegate.application(_:didFailToRegisterForRemoteNotificationsWithError:)),
+        #selector(PushForwarder.ta_application(_:didFailToRegisterForRemoteNotificationsWithError:))
+      ),
+      install(
+        cls,
+        #selector(UIApplicationDelegate.application(_:didReceiveRemoteNotification:fetchCompletionHandler:)),
+        #selector(PushForwarder.ta_application(_:didReceiveRemoteNotification:fetchCompletionHandler:))
+      ),
+    ]
+    guard !installed.contains(false) else { return }
+    swizzled = true
 
-    // didFailToRegisterForRemoteNotificationsWithError
-    swizzle(
-      type(of: delegate),
-      #selector(UIApplicationDelegate.application(_:didFailToRegisterForRemoteNotificationsWithError:)),
-      #selector(PushForwarder.ta_application(_:didFailToRegisterForRemoteNotificationsWithError:))
-    )
-
-    // didReceiveRemoteNotification (silent/background)
-    swizzle(
-      type(of: delegate),
-      #selector(UIApplicationDelegate.application(_:didReceiveRemoteNotification:fetchCompletionHandler:)),
-      #selector(PushForwarder.ta_application(_:didReceiveRemoteNotification:fetchCompletionHandler:))
-    )
+    // UIKit caches which delegate selectors exist at assignment, so reassign to pick up the new ones.
+    retainedDelegate = delegate
+    UIApplication.shared.delegate = nil
+    UIApplication.shared.delegate = delegate
   }
 
-  private static func swizzle(_ cls: AnyClass, _ original: Selector, _ replacement: Selector) {
-    guard
-      let swizzledMethod = class_getInstanceMethod(PushForwarder.self, replacement)
-    else { return }
+  @discardableResult
+  static func install(_ cls: AnyClass, _ selector: Selector, _ replacement: Selector) -> Bool {
+    guard let replacementMethod = class_getInstanceMethod(PushForwarder.self, replacement) else { return false }
+    // class_replaceMethod returns nil for an inherited implementation, so capture it first.
+    let effectiveIMP = class_getInstanceMethod(cls, selector).map(method_getImplementation)
+    let replacementIMP = method_getImplementation(replacementMethod)
+    let ownIMP = class_replaceMethod(
+      cls, selector, replacementIMP, method_getTypeEncoding(replacementMethod))
+    // A retry after a partial install must not record the forwarder as the original.
+    if ownIMP == replacementIMP { return true }
+    originalIMPs[selector] = ownIMP ?? effectiveIMP
+    return true
+  }
 
-    if let originalMethod = class_getInstanceMethod(cls, original) {
-      // Original method exists - exchange implementations
-      method_exchangeImplementations(originalMethod, swizzledMethod)
-    } else {
-      // Original method doesn't exist - add our method
-      class_addMethod(
-        cls,
-        original,
-        method_getImplementation(swizzledMethod),
-        method_getTypeEncoding(swizzledMethod)
-      )
-    }
+  fileprivate static func callOriginalDidRegister(
+    _ receiver: Any, _ selector: Selector, _ application: UIApplication, _ deviceToken: Data
+  ) {
+    guard let imp = originalIMPs[selector] else { return }
+    typealias Fn = @convention(c) (Any, Selector, UIApplication, Data) -> Void
+    unsafeBitCast(imp, to: Fn.self)(receiver, selector, application, deviceToken)
+  }
+
+  fileprivate static func callOriginalDidFail(
+    _ receiver: Any, _ selector: Selector, _ application: UIApplication, _ error: Error
+  ) {
+    guard let imp = originalIMPs[selector] else { return }
+    typealias Fn = @convention(c) (Any, Selector, UIApplication, Error) -> Void
+    unsafeBitCast(imp, to: Fn.self)(receiver, selector, application, error)
+  }
+
+  fileprivate static func callOriginalDidReceive(
+    _ receiver: Any, _ selector: Selector, _ application: UIApplication,
+    _ userInfo: [AnyHashable: Any], _ completion: @escaping (UIBackgroundFetchResult) -> Void
+  ) -> Bool {
+    guard let imp = originalIMPs[selector] else { return false }
+    typealias Fn = @convention(c) (Any, Selector, UIApplication, [AnyHashable: Any], @escaping (UIBackgroundFetchResult) -> Void) -> Void
+    unsafeBitCast(imp, to: Fn.self)(receiver, selector, application, userInfo, completion)
+    return true
   }
 }
 
-/// A helper that hosts the swizzled implementations.
-/// NOTE: These method names must exactly match the selectors we swizzle.
+/// Hosts the implementations installed onto the app delegate class. At call time
+/// `self` is the app delegate, so these may only touch params and static state.
 final class PushForwarder: NSObject, UIApplicationDelegate {
-  // Token success
   @objc func ta_application(_ application: UIApplication,
                             didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-    // Convert token to hex string
     let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-
-    // Notify plugin about token
+    let rotated = AppDelegateSwizzler.plugin?.isRegisteringPush == false
     AppDelegateSwizzler.plugin?.handlePushTokenReceived(hex)
-
-    // Also emit event for JS/Rust listeners
-    try? AppDelegateSwizzler.plugin?.trigger("push-token", data: ["token": hex])
-
-    // Call original only if it was swapped (not added)
-    if responds(to: #selector(ta_application(_:didRegisterForRemoteNotificationsWithDeviceToken:))) {
-      self.ta_application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
-    }
+    AppDelegateSwizzler.plugin?.emit("push-token", ["token": hex, "rotated": rotated])
+    AppDelegateSwizzler.callOriginalDidRegister(
+      self,
+      #selector(UIApplicationDelegate.application(_:didRegisterForRemoteNotificationsWithDeviceToken:)),
+      application,
+      deviceToken
+    )
   }
 
-  // Token failure
   @objc func ta_application(_ application: UIApplication,
                             didFailToRegisterForRemoteNotificationsWithError error: Error) {
-    // Notify plugin about error
     AppDelegateSwizzler.plugin?.handlePushTokenError(error)
-
-    // Also emit event for JS/Rust listeners
-    try? AppDelegateSwizzler.plugin?.trigger("push-error", data: ["message": error.localizedDescription])
-
-    // Call original only if it was swapped (not added)
-    if responds(to: #selector(ta_application(_:didFailToRegisterForRemoteNotificationsWithError:))) {
-      self.ta_application(application, didFailToRegisterForRemoteNotificationsWithError: error)
-    }
+    AppDelegateSwizzler.plugin?.emit("push-error", ["message": error.localizedDescription])
+    AppDelegateSwizzler.callOriginalDidFail(
+      self,
+      #selector(UIApplicationDelegate.application(_:didFailToRegisterForRemoteNotificationsWithError:)),
+      application,
+      error
+    )
   }
 
-  // Background/remote (silent) payloads
   @objc func ta_application(_ application: UIApplication,
                             didReceiveRemoteNotification userInfo: [AnyHashable : Any],
                             fetchCompletionHandler completion: @escaping (UIBackgroundFetchResult) -> Void) {
-    // Emit event for push message
+    // Tauri cannot report whether a JS listener is subscribed, so any payload counts as handled.
+    var handled = false
     if let jsData = JSTypes.coerceDictionaryToJSObject(userInfo) {
-      try? AppDelegateSwizzler.plugin?.trigger("push-message", data: jsData)
+      AppDelegateSwizzler.plugin?.emit("push-message", jsData)
+      handled = AppDelegateSwizzler.plugin != nil
     }
-
-    // Call original only if it was swapped (not added)
-    if responds(to: #selector(ta_application(_:didReceiveRemoteNotification:fetchCompletionHandler:))) {
-      self.ta_application(application, didReceiveRemoteNotification: userInfo, fetchCompletionHandler: completion)
-    } else {
-      // If no original implementation, we should still call the completion handler
-      completion(.noData)
+    let chained = AppDelegateSwizzler.callOriginalDidReceive(
+      self,
+      #selector(UIApplicationDelegate.application(_:didReceiveRemoteNotification:fetchCompletionHandler:)),
+      application,
+      userInfo,
+      completion
+    )
+    if !chained {
+      completion(handled ? .newData : .noData)
     }
   }
 }

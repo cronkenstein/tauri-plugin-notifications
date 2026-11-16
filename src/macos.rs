@@ -1,10 +1,10 @@
 use serde::de::DeserializeOwned;
 use tauri::{
-    plugin::{PermissionState, PluginApi},
     AppHandle, Runtime,
+    plugin::{PermissionState, PluginApi},
 };
 
-use crate::models::*;
+use crate::models::{ActionType, ActiveNotification, PendingNotification};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -12,9 +12,9 @@ pub use ffi::NotificationPlugin;
 
 /// Validation checks for macOS notifications functionality.
 ///
-/// UserNotifications requires the app to run from a signed .app bundle.
+/// `UserNotifications` requires the app to run from a signed .app bundle.
 /// During development with `tauri dev`, the binary runs
-/// directly without a bundle, causing UserNotifications calls to fail silently or crash.
+/// directly without a bundle, causing `UserNotifications` calls to fail silently or crash.
 mod validation {
     /// Ensures the app is running from a .app bundle.
     pub fn require_bundle() -> crate::Result<()> {
@@ -30,12 +30,7 @@ mod validation {
                 .then_some(())
             })
             .ok_or_else(|| {
-                crate::error::PluginInvokeError::InvokeRejected(crate::error::ErrorResponse {
-                    code: None,
-                    message: Some("Notifications plugin requires the app to run from a .app bundle. You can enable notify-rust feature for development.".to_string()),
-                    data: (),
-                })
-                .into()
+                crate::error::rejected(None, "Notifications plugin requires the app to run from a .app bundle. You can enable notify-rust feature for development.")
             })
     }
 }
@@ -71,12 +66,19 @@ mod ffi {
         fn removeAllActive(&self) -> Result<(), FFIResult>;
         async fn getActive(&self) -> Result<String, FFIResult>;
         fn setClickListenerActive(&self, args: String) -> Result<(), FFIResult>;
+        fn setActionListenerActive(&self, args: String) -> Result<(), FFIResult>;
     }
 }
 
 impl std::fmt::Debug for ffi::NotificationPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NotificationPlugin").finish()
+    }
+}
+
+impl From<ffi::FFIResult> for crate::Error {
+    fn from(ffi::FFIResult::Err(msg): ffi::FFIResult) -> Self {
+        crate::error::rejected(None, msg)
     }
 }
 
@@ -89,18 +91,8 @@ trait ParseFfiResponse {
 
 impl ParseFfiResponse for Result<String, ffi::FFIResult> {
     fn parse<T: DeserializeOwned>(self) -> crate::Result<T> {
-        match self {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|e| crate::error::PluginInvokeError::CannotDeserializeResponse(e).into()),
-            Err(ffi::FFIResult::Err(msg)) => Err(crate::error::PluginInvokeError::InvokeRejected(
-                crate::error::ErrorResponse {
-                    code: None,
-                    message: Some(msg),
-                    data: (),
-                },
-            )
-            .into()),
-        }
+        serde_json::from_str(&self?)
+            .map_err(|e| crate::error::PluginInvokeError::CannotDeserializeResponse(e).into())
     }
 }
 
@@ -108,54 +100,37 @@ trait ParseFfiVoidResponse {
     fn parse_void(self) -> crate::Result<()>;
 }
 
-impl ParseFfiVoidResponse for Result<(), ffi::FFIResult> {
+impl<T> ParseFfiVoidResponse for Result<T, ffi::FFIResult> {
     fn parse_void(self) -> crate::Result<()> {
-        match self {
-            Ok(()) => Ok(()),
-            Err(ffi::FFIResult::Err(msg)) => Err(crate::error::PluginInvokeError::InvokeRejected(
-                crate::error::ErrorResponse {
-                    code: None,
-                    message: Some(msg),
-                    data: (),
-                },
-            )
-            .into()),
-        }
-    }
-}
-
-impl ParseFfiVoidResponse for Result<i32, ffi::FFIResult> {
-    fn parse_void(self) -> crate::Result<()> {
-        match self {
-            Ok(_) => Ok(()),
-            Err(ffi::FFIResult::Err(msg)) => Err(crate::error::PluginInvokeError::InvokeRejected(
-                crate::error::ErrorResponse {
-                    code: None,
-                    message: Some(msg),
-                    data: (),
-                },
-            )
-            .into()),
-        }
+        self.map(|_| ()).map_err(Into::into)
     }
 }
 
 /// Called by Swift via FFI when transaction updates occur.
+// Owned strings come straight from the Swift bridge.
+#[allow(clippy::needless_pass_by_value)]
 fn bridge_trigger(event: String, payload: String) -> Result<(), ffi::FFIResult> {
     crate::listeners::trigger(&event, payload)
+        .map(|_| ())
         .map_err(|e| ffi::FFIResult::Err(format!("Failed to trigger event '{event}': {e}")))
 }
 
-pub fn init<R: Runtime, C: DeserializeOwned>(
+pub fn init<R: Runtime>(
     app: &AppHandle<R>,
-    _api: PluginApi<R, C>,
+    api: PluginApi<R, Option<crate::PluginConfig>>,
 ) -> crate::Result<Notifications<R>> {
     validation::require_bundle()?;
 
-    Ok(Notifications {
+    let notifications = Notifications {
         app: app.clone(),
         plugin: Arc::new(ffi::NotificationPlugin::init_plugin()),
-    })
+    };
+    if let Some(config) = api.config().as_ref()
+        && !config.action_types.is_empty()
+    {
+        notifications.register_action_types(config.action_types.clone())?;
+    }
+    Ok(notifications)
 }
 
 impl<R: Runtime> crate::NotificationsBuilder<R> {
@@ -165,7 +140,7 @@ impl<R: Runtime> crate::NotificationsBuilder<R> {
         self.plugin
             .show(
                 serde_json::to_string(&self.data)
-                    .map_err(|e| crate::error::PluginInvokeError::CannotSerializePayload(e))?,
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
             )
             .await
             .parse_void()
@@ -189,14 +164,17 @@ impl<R: Runtime> Notifications<R> {
         Ok(response.permission_state)
     }
 
-    pub async fn register_for_push_notifications(&self) -> crate::Result<String> {
+    pub async fn register_for_push_notifications(
+        &self,
+        _vapid: Option<String>,
+    ) -> crate::Result<crate::PushNotificationResponse> {
         validation::require_bundle()?;
 
         #[cfg(feature = "push-notifications")]
         {
             let response: crate::PushNotificationResponse =
                 self.plugin.registerForPushNotifications().await.parse()?;
-            Ok(response.device_token)
+            Ok(response)
         }
         #[cfg(not(feature = "push-notifications"))]
         {
@@ -266,7 +244,7 @@ impl<R: Runtime> Notifications<R> {
         self.plugin
             .registerActionTypes(
                 serde_json::to_string(&args)
-                    .map_err(|e| crate::error::PluginInvokeError::CannotSerializePayload(e))?,
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
             )
             .parse_void()
     }
@@ -289,7 +267,7 @@ impl<R: Runtime> Notifications<R> {
         self.plugin
             .removeActive(
                 serde_json::to_string(&args)
-                    .map_err(|e| crate::error::PluginInvokeError::CannotSerializePayload(e))?,
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
             )
             .parse_void()
     }
@@ -321,7 +299,7 @@ impl<R: Runtime> Notifications<R> {
         self.plugin
             .cancel(
                 serde_json::to_string(&args)
-                    .map_err(|e| crate::error::PluginInvokeError::CannotSerializePayload(e))?,
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
             )
             .parse_void()
     }
@@ -343,9 +321,49 @@ impl<R: Runtime> Notifications<R> {
         self.plugin
             .setClickListenerActive(
                 serde_json::to_string(&args)
-                    .map_err(|e| crate::error::PluginInvokeError::CannotSerializePayload(e))?,
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
             )
             .parse_void()
+    }
+
+    pub fn set_action_listener_active(&self, active: bool) -> crate::Result<()> {
+        validation::require_bundle()?;
+
+        let mut args = HashMap::new();
+        args.insert("active", active);
+        self.plugin
+            .setActionListenerActive(
+                serde_json::to_string(&args)
+                    .map_err(crate::error::PluginInvokeError::CannotSerializePayload)?,
+            )
+            .parse_void()
+    }
+
+    pub const fn set_push_message_listener_active(&self, _active: bool) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn is_ignoring_battery_optimizations(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn request_ignore_battery_optimizations(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn can_schedule_exact_alarms(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn request_schedule_exact_alarms(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn push_transport(&self) -> crate::Result<crate::models::PushTransport> {
+        Ok(crate::models::PushTransport::default())
     }
 
     /// Create a notification channel (not supported on macOS).

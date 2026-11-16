@@ -1,39 +1,88 @@
 //! Send message notifications (brief auto-expiring OS window element) to your user. Can also be used with the Notification Web API.
 
-use serde::Serialize;
-#[cfg(mobile)]
-use tauri::plugin::PluginHandle;
+use serde::{Deserialize, Serialize};
 #[cfg(desktop)]
 use tauri::AppHandle;
+#[cfg(mobile)]
+use tauri::plugin::PluginHandle;
 use tauri::{
-    plugin::{Builder, TauriPlugin},
     Manager, Runtime,
+    plugin::{Builder, TauriPlugin},
 };
+
+/// Top-level plugin config deserialized from the `plugins.notifications` block
+/// in `tauri.conf.json`. Optional in its entirety — apps without a config block
+/// get `PluginConfig::default()`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PluginConfig {
+    /// Notification action categories registered during native plugin startup.
+    /// This is required for provider-rendered iOS notifications whose
+    /// `aps.category` is received before JavaScript initializes.
+    #[serde(default)]
+    pub action_types: Vec<ActionType>,
+    #[cfg(target_os = "windows")]
+    pub windows: WindowsConfig,
+}
+
+/// Windows-only plugin config.
+///
+/// Currently carries the toast activator CLSID used by
+/// `INotificationActivationCallback` registration; absent value means
+/// COM-based activation is disabled and the plugin falls back to in-process
+/// `Activated` events only.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WindowsConfig {
+    /// Toast activator CLSID. Must match the GUID declared in the MSIX
+    /// manifest's `<desktop:ToastNotificationActivation ToastActivatorCLSID>`
+    /// and `<com:Class Id>` entries. Accepts the `xxxxxxxx-xxxx-...` form
+    /// with or without surrounding braces.
+    pub toast_activator_clsid: Option<String>,
+    /// Unpackaged apps: register the COM activator in `HKCU` so Action Center
+    /// and cold-start clicks reach the app. The CLSID is
+    /// `toast_activator_clsid`, or derived from the identifier.
+    pub register_unpackaged_activator: bool,
+}
 
 pub use models::*;
 pub use tauri::plugin::PermissionState;
 
-#[cfg(all(desktop, feature = "notify-rust"))]
+#[cfg(all(desktop, any(feature = "notify-rust", target_os = "linux")))]
 mod desktop;
 #[cfg(all(target_os = "macos", not(feature = "notify-rust")))]
 mod macos;
 #[cfg(mobile)]
 mod mobile;
+#[cfg(all(desktop, target_os = "linux", feature = "push-notifications"))]
+mod unifiedpush;
+#[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+mod windows;
 
+#[cfg(any(test, all(target_os = "windows", not(feature = "notify-rust"))))]
+mod activation;
 mod commands;
 mod error;
+#[cfg(any(
+    all(desktop, target_os = "linux"),
+    all(target_os = "windows", not(feature = "notify-rust"))
+))]
+mod focus;
 #[cfg(desktop)]
 mod listeners;
 mod models;
 
 pub use error::{Error, Result};
 
-#[cfg(all(desktop, feature = "notify-rust"))]
+#[cfg(all(desktop, any(feature = "notify-rust", target_os = "linux")))]
 pub use desktop::Notifications;
 #[cfg(all(target_os = "macos", not(feature = "notify-rust")))]
 pub use macos::Notifications;
 #[cfg(mobile)]
 pub use mobile::Notifications;
+#[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+pub use windows::Notifications;
 
 /// The notification builder.
 #[derive(Debug)]
@@ -43,22 +92,33 @@ pub struct NotificationsBuilder<R: Runtime> {
     app: AppHandle<R>,
     #[cfg(all(target_os = "macos", not(feature = "notify-rust")))]
     plugin: std::sync::Arc<macos::NotificationPlugin>,
+    #[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+    plugin: std::sync::Arc<windows::WindowsPlugin>,
     #[cfg(mobile)]
     handle: PluginHandle<R>,
     pub(crate) data: NotificationData,
 }
 
 impl<R: Runtime> NotificationsBuilder<R> {
-    #[cfg(all(desktop, feature = "notify-rust"))]
+    #[cfg(all(desktop, any(feature = "notify-rust", target_os = "linux")))]
     fn new(app: AppHandle<R>) -> Self {
         Self {
             app,
-            data: Default::default(),
+            data: NotificationData::default(),
         }
     }
 
     #[cfg(all(target_os = "macos", not(feature = "notify-rust")))]
     fn new(app: AppHandle<R>, plugin: std::sync::Arc<macos::NotificationPlugin>) -> Self {
+        Self {
+            app,
+            plugin,
+            data: NotificationData::default(),
+        }
+    }
+
+    #[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+    fn new(app: AppHandle<R>, plugin: std::sync::Arc<windows::WindowsPlugin>) -> Self {
         Self {
             app,
             plugin,
@@ -70,12 +130,13 @@ impl<R: Runtime> NotificationsBuilder<R> {
     fn new(handle: PluginHandle<R>) -> Self {
         Self {
             handle,
-            data: Default::default(),
+            data: NotificationData::default(),
         }
     }
 
     /// Sets the notification identifier.
-    pub fn id(mut self, id: i32) -> Self {
+    #[must_use]
+    pub const fn id(mut self, id: i32) -> Self {
         self.data.id = id;
         self
     }
@@ -84,25 +145,29 @@ impl<R: Runtime> NotificationsBuilder<R> {
     ///
     /// If the channel does not exist, the notification won't fire.
     /// Make sure the channel exists with {@link listChannels} and {@link createChannel}.
+    #[must_use]
     pub fn channel_id(mut self, id: impl Into<String>) -> Self {
         self.data.channel_id.replace(id.into());
         self
     }
 
     /// Sets the notification title.
+    #[must_use]
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.data.title.replace(title.into());
         self
     }
 
     /// Sets the notification body.
+    #[must_use]
     pub fn body(mut self, body: impl Into<String>) -> Self {
         self.data.body.replace(body.into());
         self
     }
 
     /// Schedule this notification to fire on a later time or a fixed interval.
-    pub fn schedule(mut self, schedule: Schedule) -> Self {
+    #[must_use]
+    pub const fn schedule(mut self, schedule: Schedule) -> Self {
         self.data.schedule.replace(schedule);
         self
     }
@@ -110,18 +175,21 @@ impl<R: Runtime> NotificationsBuilder<R> {
     /// Multiline text.
     /// Changes the notification style to big text.
     /// Cannot be used with `inboxLines`.
+    #[must_use]
     pub fn large_body(mut self, large_body: impl Into<String>) -> Self {
         self.data.large_body.replace(large_body.into());
         self
     }
 
     /// Detail text for the notification with `largeBody`, `inboxLines` or `groupSummary`.
+    #[must_use]
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         self.data.summary.replace(summary.into());
         self
     }
 
     /// Defines an action type for this notification.
+    #[must_use]
     pub fn action_type_id(mut self, action_type_id: impl Into<String>) -> Self {
         self.data.action_type_id.replace(action_type_id.into());
         self
@@ -130,18 +198,21 @@ impl<R: Runtime> NotificationsBuilder<R> {
     /// Identifier used to group multiple notifications.
     ///
     /// <https://developer.apple.com/documentation/usernotifications/unmutablenotificationcontent/1649872-threadidentifier>
+    #[must_use]
     pub fn group(mut self, group: impl Into<String>) -> Self {
         self.data.group.replace(group.into());
         self
     }
 
     /// Instructs the system that this notification is the summary of a group on Android.
-    pub fn group_summary(mut self) -> Self {
+    #[must_use]
+    pub const fn group_summary(mut self) -> Self {
         self.data.group_summary = true;
         self
     }
 
     /// The sound resource name. Only available on mobile.
+    #[must_use]
     pub fn sound(mut self, sound: impl Into<String>) -> Self {
         self.data.sound.replace(sound.into());
         self
@@ -152,14 +223,33 @@ impl<R: Runtime> NotificationsBuilder<R> {
     /// Cannot be used with `largeBody`.
     ///
     /// Only supports up to 5 lines.
+    #[must_use]
     pub fn inbox_line(mut self, line: impl Into<String>) -> Self {
         self.data.inbox_lines.push(line.into());
+        self
+    }
+
+    /// Append a message to the conversation.
+    /// Changes the notification style to messaging on Android.
+    /// Takes precedence over `largeBody` and inbox lines.
+    #[must_use]
+    pub fn message(mut self, message: NotificationMessage) -> Self {
+        self.data.messages.push(message);
+        self
+    }
+
+    /// Marks a `messages` conversation as having more than two participants, so
+    /// Android shows the conversation title alongside each sender.
+    #[must_use]
+    pub const fn group_conversation(mut self, group_conversation: bool) -> Self {
+        self.data.group_conversation = group_conversation;
         self
     }
 
     /// Notification icon.
     ///
     /// On Android the icon must be placed in the app's `res/drawable` folder.
+    #[must_use]
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
         self.data.icon.replace(icon.into());
         self
@@ -168,24 +258,28 @@ impl<R: Runtime> NotificationsBuilder<R> {
     /// Notification large icon (Android).
     ///
     /// The icon must be placed in the app's `res/drawable` folder.
+    #[must_use]
     pub fn large_icon(mut self, large_icon: impl Into<String>) -> Self {
         self.data.large_icon.replace(large_icon.into());
         self
     }
 
     /// Icon color on Android.
+    #[must_use]
     pub fn icon_color(mut self, icon_color: impl Into<String>) -> Self {
         self.data.icon_color.replace(icon_color.into());
         self
     }
 
     /// Append an attachment to the notification.
+    #[must_use]
     pub fn attachment(mut self, attachment: Attachment) -> Self {
         self.data.attachments.push(attachment);
         self
     }
 
     /// Adds an extra payload to store in the notification.
+    #[must_use]
     pub fn extra(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
         if let Ok(value) = serde_json::to_value(value) {
             self.data.extra.insert(key.into(), value);
@@ -198,20 +292,30 @@ impl<R: Runtime> NotificationsBuilder<R> {
     /// An application service must manage the dismissal of the notification.
     /// It is typically used to indicate a background task that is pending (e.g. a file download)
     /// or the user is engaged with (e.g. playing music).
-    pub fn ongoing(mut self) -> Self {
+    #[must_use]
+    pub const fn ongoing(mut self) -> Self {
         self.data.ongoing = true;
         self
     }
 
     /// Automatically cancel the notification when the user clicks on it.
-    pub fn auto_cancel(mut self) -> Self {
+    #[must_use]
+    pub const fn auto_cancel(mut self) -> Self {
         self.data.auto_cancel = true;
         self
     }
 
     /// Changes the notification presentation to be silent on iOS (no badge, no sound, not listed).
-    pub fn silent(mut self) -> Self {
+    #[must_use]
+    pub const fn silent(mut self) -> Self {
         self.data.silent = true;
+        self
+    }
+
+    /// Whether replacing a visible notification alerts again. Android only, `true` when unset.
+    #[must_use]
+    pub const fn only_alert_once(mut self, only_alert_once: bool) -> Self {
+        self.data.only_alert_once = Some(only_alert_once);
         self
     }
 }
@@ -228,8 +332,9 @@ impl<R: Runtime, T: Manager<R>> crate::NotificationsExt<R> for T {
 }
 
 /// Initializes the plugin.
-pub fn init<R: Runtime>() -> TauriPlugin<R> {
-    Builder::new("notifications")
+#[must_use]
+pub fn init<R: Runtime>() -> TauriPlugin<R, Option<PluginConfig>> {
+    Builder::<R, Option<PluginConfig>>::new("notifications")
         .invoke_handler(tauri::generate_handler![
             commands::notify,
             commands::request_permission,
@@ -245,7 +350,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::get_pending,
             commands::get_active,
             commands::set_click_listener_active,
+            commands::set_action_listener_active,
+            commands::set_push_message_listener_active,
+            commands::push_transport,
+            commands::is_ignoring_battery_optimizations,
+            commands::request_ignore_battery_optimizations,
+            commands::can_schedule_exact_alarms,
+            commands::request_schedule_exact_alarms,
             commands::remove_active,
+            commands::remove_all,
             commands::cancel,
             commands::cancel_all,
             commands::create_channel,
@@ -255,16 +368,39 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             listeners::register_listener,
             #[cfg(desktop)]
             listeners::remove_listener,
+            #[cfg(all(
+                feature = "push-notifications",
+                any(all(desktop, target_os = "linux"), target_os = "android")
+            ))]
+            commands::list_distributors,
+            #[cfg(all(
+                feature = "push-notifications",
+                any(all(desktop, target_os = "linux"), target_os = "android")
+            ))]
+            commands::set_distributor,
+            #[cfg(all(
+                feature = "push-notifications",
+                any(all(desktop, target_os = "linux"), target_os = "android")
+            ))]
+            commands::set_token,
         ])
         .setup(|app, api| {
             #[cfg(desktop)]
             listeners::init();
+            #[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+            let windows_config = api
+                .config()
+                .as_ref()
+                .map(|c| c.windows.clone())
+                .unwrap_or_default();
             #[cfg(mobile)]
             let notification = mobile::init(app, api)?;
-            #[cfg(all(desktop, feature = "notify-rust"))]
-            let notification = desktop::init(app, api)?;
+            #[cfg(all(desktop, any(feature = "notify-rust", target_os = "linux")))]
+            let notification = desktop::init(app, &api)?;
             #[cfg(all(target_os = "macos", not(feature = "notify-rust")))]
             let notification = macos::init(app, api)?;
+            #[cfg(all(target_os = "windows", not(feature = "notify-rust")))]
+            let notification = windows::init(app, api, windows_config)?;
             app.manage(notification);
             Ok(())
         })

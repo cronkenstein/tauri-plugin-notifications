@@ -484,16 +484,47 @@ describe("Notification Functions", () => {
   });
 
   describe("registerForPushNotifications", () => {
-    it("should call invoke and return push token", async () => {
-      const mockToken = "abc123token";
-      mockInvoke.mockResolvedValue(mockToken);
+    it("should call invoke and return the registration", async () => {
+      const registration = { deviceToken: "abc123token" };
+      mockInvoke.mockResolvedValue(registration);
 
-      const result = await registerForPushNotifications();
+      const result = await registerForPushNotifications("vapid-key");
 
       expect(mockInvoke).toHaveBeenCalledWith(
         "plugin:notifications|register_for_push_notifications",
+        { vapid: "vapid-key", provider: "auto" },
       );
-      expect(result).toBe(mockToken);
+      expect(result).toBe(registration);
+    });
+
+    it("should forward the embedded gateway url", async () => {
+      mockInvoke.mockResolvedValue({ deviceToken: "https://ntfy.sh/upabc" });
+
+      await registerForPushNotifications(
+        undefined,
+        "embedded",
+        "https://ntfy.sh",
+      );
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "plugin:notifications|register_for_push_notifications",
+        {
+          vapid: undefined,
+          provider: "embedded",
+          embeddedGatewayUrl: "https://ntfy.sh",
+        },
+      );
+    });
+
+    it("should forward an explicit push provider", async () => {
+      mockInvoke.mockResolvedValue({ deviceToken: "token" });
+
+      await registerForPushNotifications("vapid-key", "unifiedpush");
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "plugin:notifications|register_for_push_notifications",
+        { vapid: "vapid-key", provider: "unifiedpush" },
+      );
     });
   });
 
@@ -508,8 +539,8 @@ describe("Notification Functions", () => {
       );
     });
 
-    it("should resolve without a return value", async () => {
-      mockInvoke.mockResolvedValue(undefined);
+    it("should resolve to void regardless of the invoke return value", async () => {
+      mockInvoke.mockResolvedValue("ignored");
 
       const result = await unregisterForPushNotifications();
 
@@ -1097,7 +1128,7 @@ describe("Notification Functions", () => {
       await removeAllActive();
 
       expect(mockInvoke).toHaveBeenCalledWith(
-        "plugin:notifications|remove_active",
+        "plugin:notifications|remove_all",
       );
     });
   });
@@ -1213,7 +1244,9 @@ describe("Notification Functions", () => {
 
       mockAddPluginListener.mockImplementation((_plugin, _event, cb) => {
         capturedCallback = cb;
-        return Promise.resolve(vi.fn());
+        return Promise.resolve({
+          unregister: vi.fn().mockResolvedValue(undefined),
+        });
       });
 
       const callback = vi.fn();
@@ -1227,8 +1260,9 @@ describe("Notification Functions", () => {
 
   describe("onAction", () => {
     it("should register action performed listener", async () => {
-      const mockUnlisten = vi.fn();
-      mockAddPluginListener.mockResolvedValue(mockUnlisten);
+      const mockUnregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister: mockUnregister });
+      mockInvoke.mockResolvedValue(undefined);
 
       const callback = vi.fn();
       const unlisten = await onAction(callback);
@@ -1238,24 +1272,152 @@ describe("Notification Functions", () => {
         "actionPerformed",
         callback,
       );
-      expect(unlisten).toBe(mockUnlisten);
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "plugin:notifications|set_action_listener_active",
+        { active: true },
+      );
+      expect(unlisten).toHaveProperty("unregister");
+      await unlisten.unregister();
     });
 
     it("should call callback when action performed", async () => {
-      const mockNotification = { title: "Test", actionTypeId: "action-1" };
-      let capturedCallback: ((notification: any) => void) | undefined;
+      const mockAction = {
+        actionId: "reply",
+        inputValue: "Hello",
+        notification: {
+          id: 1,
+          actionTypeId: "message-actions",
+          extra: { room_id: "!room:example.org" },
+        },
+      };
+      let capturedCallback: ((action: any) => void) | undefined;
 
       mockAddPluginListener.mockImplementation((_plugin, _event, cb) => {
         capturedCallback = cb;
-        return Promise.resolve(vi.fn());
+        return Promise.resolve({
+          unregister: vi.fn().mockResolvedValue(undefined),
+        });
       });
 
       const callback = vi.fn();
-      await onAction(callback);
+      const listener = await onAction(callback);
 
-      capturedCallback?.(mockNotification);
+      capturedCallback?.(mockAction);
 
-      expect(callback).toHaveBeenCalledWith(mockNotification);
+      expect(callback).toHaveBeenCalledWith(mockAction);
+      await listener.unregister();
+    });
+
+    it("should notify native side before unregistering", async () => {
+      const mockUnregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister: mockUnregister });
+      mockInvoke.mockResolvedValue(undefined);
+
+      const listener = await onAction(vi.fn());
+      mockInvoke.mockClear();
+      await listener.unregister();
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "plugin:notifications|set_action_listener_active",
+        { active: false },
+      );
+      expect(mockUnregister).toHaveBeenCalled();
+    });
+
+    it("activates once for multiple listeners and deactivates after the last one", async () => {
+      const firstUnregister = vi.fn().mockResolvedValue(undefined);
+      const secondUnregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener
+        .mockResolvedValueOnce({ unregister: firstUnregister })
+        .mockResolvedValueOnce({ unregister: secondUnregister });
+      mockInvoke.mockResolvedValue(undefined);
+
+      const first = await onAction(vi.fn());
+      const second = await onAction(vi.fn());
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      await first.unregister();
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      await second.unregister();
+      expect(mockInvoke).toHaveBeenCalledTimes(2);
+    });
+
+    it("counts a listener once when unregister is called concurrently", async () => {
+      mockAddPluginListener.mockResolvedValue({
+        unregister: vi.fn().mockResolvedValue(undefined),
+      });
+      mockInvoke.mockResolvedValue(undefined);
+
+      const first = await onAction(vi.fn());
+      const second = await onAction(vi.fn());
+      await Promise.all([first.unregister(), first.unregister()]);
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      await second.unregister();
+      expect(mockInvoke).toHaveBeenCalledTimes(2);
+    });
+
+    it("resolves concurrent unregister calls only after the real one completes", async () => {
+      const unregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister });
+      let release: () => void = () => {};
+      mockInvoke
+        .mockResolvedValueOnce(undefined)
+        .mockReturnValueOnce(new Promise<void>((r) => (release = r)));
+
+      const listener = await onAction(vi.fn());
+      let secondDone = false;
+      const first = listener.unregister();
+      const second = listener.unregister().then(() => (secondDone = true));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(secondDone).toBe(false);
+      release();
+      await Promise.all([first, second]);
+      expect(secondDone).toBe(true);
+      expect(unregister).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects every concurrent unregister call when the real one fails", async () => {
+      mockAddPluginListener.mockResolvedValue({
+        unregister: vi.fn().mockResolvedValue(undefined),
+      });
+      mockInvoke
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("deactivation failed"));
+
+      const listener = await onAction(vi.fn());
+      const results = await Promise.allSettled([
+        listener.unregister(),
+        listener.unregister(),
+      ]);
+      expect(results.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+      mockInvoke.mockResolvedValue(undefined);
+      await listener.unregister();
+    });
+
+    it("rolls back the JS listener when activation fails", async () => {
+      const unregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister });
+      mockInvoke.mockRejectedValueOnce(new Error("activation failed"));
+
+      await expect(onAction(vi.fn())).rejects.toThrow("activation failed");
+      expect(unregister).toHaveBeenCalled();
+    });
+
+    it("keeps the final JS listener and allows cleanup retry when deactivation fails", async () => {
+      const unregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister });
+      mockInvoke
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("deactivation failed"))
+        .mockResolvedValueOnce(undefined);
+
+      const listener = await onAction(vi.fn());
+      await expect(listener.unregister()).rejects.toThrow(
+        "deactivation failed",
+      );
+      expect(unregister).not.toHaveBeenCalled();
+      await listener.unregister();
+      expect(unregister).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1280,6 +1442,7 @@ describe("Notification Functions", () => {
         },
       );
       expect(listener).toHaveProperty("unregister");
+      await listener.unregister();
     });
 
     it("should notify native side on unregister", async () => {
@@ -1308,15 +1471,18 @@ describe("Notification Functions", () => {
 
       mockAddPluginListener.mockImplementation((_plugin, _event, cb) => {
         capturedCallback = cb;
-        return Promise.resolve(vi.fn());
+        return Promise.resolve({
+          unregister: vi.fn().mockResolvedValue(undefined),
+        });
       });
 
       const callback = vi.fn();
-      await onNotificationClicked(callback);
+      const listener = await onNotificationClicked(callback);
 
       capturedCallback?.(mockClickedData);
 
       expect(callback).toHaveBeenCalledWith(mockClickedData);
+      await listener.unregister();
     });
 
     it("should handle notification click without data", async () => {
@@ -1325,16 +1491,48 @@ describe("Notification Functions", () => {
 
       mockAddPluginListener.mockImplementation((_plugin, _event, cb) => {
         capturedCallback = cb;
-        return Promise.resolve(vi.fn());
+        return Promise.resolve({
+          unregister: vi.fn().mockResolvedValue(undefined),
+        });
       });
 
       const callback = vi.fn();
-      await onNotificationClicked(callback);
+      const listener = await onNotificationClicked(callback);
 
       capturedCallback?.(mockClickedData);
 
       expect(callback).toHaveBeenCalledWith(mockClickedData);
       expect(callback.mock.calls[0][0].data).toBeUndefined();
+      await listener.unregister();
+    });
+
+    it("keeps native click delivery until the last listener unregisters", async () => {
+      mockAddPluginListener.mockResolvedValue({
+        unregister: vi.fn().mockResolvedValue(undefined),
+      });
+      mockInvoke.mockResolvedValue(undefined);
+
+      const first = await onNotificationClicked(vi.fn());
+      const second = await onNotificationClicked(vi.fn());
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      await first.unregister();
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      await second.unregister();
+      expect(mockInvoke).toHaveBeenLastCalledWith(
+        "plugin:notifications|set_click_listener_active",
+        { active: false },
+      );
+    });
+
+    it("unregisters the channel when activation fails", async () => {
+      const unregister = vi.fn().mockResolvedValue(undefined);
+      mockAddPluginListener.mockResolvedValue({ unregister });
+      mockInvoke.mockRejectedValueOnce(new Error("activation failed"));
+
+      await expect(onNotificationClicked(vi.fn())).rejects.toThrow(
+        "activation failed",
+      );
+      expect(unregister).toHaveBeenCalled();
     });
   });
 

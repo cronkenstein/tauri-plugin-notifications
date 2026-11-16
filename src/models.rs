@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display};
 
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use tauri::plugin::PermissionState;
 
 use url::Url;
@@ -11,11 +11,16 @@ pub struct PermissionResponse {
     pub permission_state: PermissionState,
 }
 
-#[cfg(feature = "push-notifications")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushNotificationResponse {
     pub device_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p256dh: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
 
 #[cfg(feature = "unified-push")]
@@ -49,7 +54,56 @@ pub struct UnifiedPushDistributorResponse {
     pub distributor: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl PushNotificationResponse {
+    #[must_use]
+    pub const fn from_token(device_token: String) -> Self {
+        Self {
+            device_token,
+            p256dh: None,
+            auth: None,
+            instance: None,
+        }
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "push-notifications"))]
+#[derive(Debug, Deserialize)]
+pub struct DistributorsResponse {
+    pub distributors: Vec<String>,
+}
+
+#[cfg(all(target_os = "android", feature = "push-notifications"))]
+#[derive(Debug, Deserialize)]
+pub struct BatteryOptimizationResponse {
+    pub ignoring: bool,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Deserialize)]
+pub struct ExactAlarmResponse {
+    pub allowed: bool,
+}
+
+/// Push provider requested at registration. Mirrors the guest `PushProvider` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushProvider {
+    Auto,
+    Fcm,
+    UnifiedPush,
+    Embedded,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushTransport {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub distributor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
     id: String,
@@ -60,9 +114,19 @@ impl Attachment {
     pub fn new(id: impl Into<String>, url: Url) -> Self {
         Self { id: id.into(), url }
     }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleInterval {
     pub year: Option<u8>,
@@ -74,7 +138,7 @@ pub struct ScheduleInterval {
     pub second: Option<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ScheduleEvery {
     Year,
     Month,
@@ -134,7 +198,7 @@ impl<'de> Deserialize<'de> for ScheduleEvery {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Schedule {
     #[serde(rename_all = "camelCase")]
@@ -166,11 +230,11 @@ pub enum Schedule {
 
 // custom ISO-8601 serialization that does not use 6 digits for years.
 mod iso8601 {
-    use serde::{ser::Error as _, Serialize, Serializer};
+    use serde::{Serialize, Serializer, ser::Error as _};
     use time::{
-        format_description::well_known::iso8601::{Config, EncodedConfig},
-        format_description::well_known::Iso8601,
         OffsetDateTime,
+        format_description::well_known::Iso8601,
+        format_description::well_known::iso8601::{Config, EncodedConfig},
     };
 
     const SERDE_CONFIG: EncodedConfig = Config::DEFAULT.encode();
@@ -186,6 +250,23 @@ mod iso8601 {
     }
 }
 
+/// One message of a conversation notification, rendered by Android's `MessagingStyle`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationMessage {
+    #[serde(default)]
+    pub(crate) event_id: Option<String>,
+    #[serde(default)]
+    pub(crate) encrypted: bool,
+    pub(crate) body: String,
+    #[serde(default)]
+    pub(crate) timestamp: i64,
+    pub(crate) sender_name: Option<String>,
+    pub(crate) sender_key: Option<String>,
+}
+
+// Each bool is an independent flag in the JS wire format; grouping them would change the JSON shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationData {
@@ -204,6 +285,10 @@ pub struct NotificationData {
     pub(crate) sound: Option<String>,
     #[serde(default)]
     pub(crate) inbox_lines: Vec<String>,
+    #[serde(default)]
+    pub(crate) messages: Vec<NotificationMessage>,
+    #[serde(default)]
+    pub(crate) group_conversation: bool,
     pub(crate) icon: Option<String>,
     pub(crate) large_icon: Option<String>,
     pub(crate) icon_color: Option<String>,
@@ -228,6 +313,7 @@ pub struct NotificationData {
     pub(crate) category: Option<String>,
     /// Conversation-style (MessagingStyle) notification configuration (Android).
     pub(crate) messaging_style: Option<MessagingStyleConfig>,
+    pub(crate) only_alert_once: Option<bool>,
 }
 
 fn default_id() -> i32 {
@@ -249,11 +335,13 @@ impl Default for NotificationData {
             group_summary: false,
             sound: None,
             inbox_lines: Vec::new(),
+            messages: Vec::new(),
+            group_conversation: false,
             icon: None,
             large_icon: None,
             icon_color: None,
             attachments: Vec::new(),
-            extra: Default::default(),
+            extra: HashMap::default(),
             ongoing: false,
             auto_cancel: false,
             silent: false,
@@ -262,6 +350,7 @@ impl Default for NotificationData {
             progress_indeterminate: false,
             category: None,
             messaging_style: None,
+            only_alert_once: None,
         }
     }
 }
@@ -269,102 +358,141 @@ impl Default for NotificationData {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingNotification {
-    id: i32,
-    title: Option<String>,
-    body: Option<String>,
-    schedule: Schedule,
+    pub(crate) id: i32,
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) schedule: Schedule,
 }
 
 impl PendingNotification {
-    pub fn id(&self) -> i32 {
+    #[must_use]
+    pub const fn id(&self) -> i32 {
         self.id
     }
 
+    #[must_use]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<&str> {
         self.body.as_deref()
     }
 
-    pub fn schedule(&self) -> &Schedule {
+    #[must_use]
+    pub const fn schedule(&self) -> &Schedule {
         &self.schedule
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveNotification {
-    id: i32,
-    tag: Option<String>,
-    title: Option<String>,
-    body: Option<String>,
-    group: Option<String>,
+    pub(crate) id: i32,
+    pub(crate) tag: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) group: Option<String>,
     #[serde(default)]
-    group_summary: bool,
+    pub(crate) group_summary: bool,
     #[serde(default)]
-    data: HashMap<String, String>,
+    pub(crate) data: HashMap<String, String>,
     #[serde(default)]
-    extra: HashMap<String, serde_json::Value>,
+    pub(crate) extra: HashMap<String, serde_json::Value>,
     #[serde(default)]
-    attachments: Vec<Attachment>,
-    action_type_id: Option<String>,
-    schedule: Option<Schedule>,
-    sound: Option<String>,
+    pub(crate) attachments: Vec<Attachment>,
+    pub(crate) action_type_id: Option<String>,
+    pub(crate) schedule: Option<Schedule>,
+    pub(crate) sound: Option<String>,
 }
 
 impl ActiveNotification {
-    pub fn id(&self) -> i32 {
+    /// Constructs an `ActiveNotification` from the minimal set of fields the
+    /// desktop tracking layer can populate. All other fields fall back to
+    /// their defaults (the mobile/native paths fill them out fully).
+    #[must_use]
+    pub fn new(id: i32, title: Option<String>, body: Option<String>) -> Self {
+        Self {
+            id,
+            tag: None,
+            title,
+            body,
+            group: None,
+            group_summary: false,
+            data: HashMap::new(),
+            extra: HashMap::new(),
+            attachments: Vec::new(),
+            action_type_id: None,
+            schedule: None,
+            sound: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> i32 {
         self.id
     }
 
+    #[must_use]
     pub fn tag(&self) -> Option<&str> {
         self.tag.as_deref()
     }
 
+    #[must_use]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 
+    #[must_use]
     pub fn body(&self) -> Option<&str> {
         self.body.as_deref()
     }
 
+    #[must_use]
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
     }
 
-    pub fn group_summary(&self) -> bool {
+    #[must_use]
+    pub const fn group_summary(&self) -> bool {
         self.group_summary
     }
 
-    pub fn data(&self) -> &HashMap<String, String> {
+    #[must_use]
+    pub const fn data(&self) -> &HashMap<String, String> {
         &self.data
     }
 
-    pub fn extra(&self) -> &HashMap<String, serde_json::Value> {
+    #[must_use]
+    pub const fn extra(&self) -> &HashMap<String, serde_json::Value> {
         &self.extra
     }
 
+    #[must_use]
     pub fn attachments(&self) -> &[Attachment] {
         &self.attachments
     }
 
+    #[must_use]
     pub fn action_type_id(&self) -> Option<&str> {
         self.action_type_id.as_deref()
     }
 
-    pub fn schedule(&self) -> Option<&Schedule> {
+    #[must_use]
+    pub const fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
     }
 
+    #[must_use]
     pub fn sound(&self) -> Option<&str> {
         self.sound.as_deref()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// Each bool is an independent UNNotificationCategory option; grouping would change the JSON shape.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionType {
     id: String,
@@ -380,7 +508,33 @@ pub struct ActionType {
     hidden_previews_show_subtitle: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl ActionType {
+    pub fn new(id: impl Into<String>, actions: Vec<Action>) -> Self {
+        Self {
+            id: id.into(),
+            actions,
+            hidden_previews_body_placeholder: None,
+            custom_dismiss_action: false,
+            allow_in_car_play: false,
+            hidden_previews_show_title: false,
+            hidden_previews_show_subtitle: false,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+}
+
+// Each bool is an independent UNNotificationAction option; grouping would change the JSON shape.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Action {
     id: String,
@@ -427,6 +581,42 @@ pub struct MessagingStyleConfig {
     pub messages: Vec<MessagingStyleMessage>,
     #[serde(skip_serializing)]
     pub auth_token: Option<String>,
+}
+
+impl Action {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, foreground: bool) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            requires_authentication: false,
+            foreground,
+            destructive: false,
+            input: false,
+            input_button_title: None,
+            input_placeholder: None,
+            icon: None,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    #[must_use]
+    pub const fn foreground(&self) -> bool {
+        self.foreground
+    }
+
+    #[must_use]
+    pub const fn input(&self) -> bool {
+        self.input
+    }
 }
 
 pub use android::*;
@@ -481,84 +671,101 @@ mod android {
                 lights: Some(false),
                 light_color: None,
                 vibration: Some(false),
-                importance: Default::default(),
+                importance: None,
                 visibility: None,
             })
         }
 
+        #[must_use]
         pub fn id(&self) -> &str {
             &self.id
         }
 
+        #[must_use]
         pub fn name(&self) -> &str {
             &self.name
         }
 
+        #[must_use]
         pub fn description(&self) -> Option<&str> {
             self.description.as_deref()
         }
 
+        #[must_use]
         pub fn sound(&self) -> Option<&str> {
             self.sound.as_deref()
         }
 
+        #[must_use]
         pub fn lights(&self) -> bool {
             self.lights.unwrap_or(false)
         }
 
+        #[must_use]
         pub fn light_color(&self) -> Option<&str> {
             self.light_color.as_deref()
         }
 
+        #[must_use]
         pub fn vibration(&self) -> bool {
             self.vibration.unwrap_or(false)
         }
 
+        #[must_use]
         pub fn importance(&self) -> Importance {
             self.importance.unwrap_or_default()
         }
 
-        pub fn visibility(&self) -> Option<Visibility> {
+        #[must_use]
+        pub const fn visibility(&self) -> Option<Visibility> {
             self.visibility
         }
     }
 
     impl ChannelBuilder {
+        #[must_use]
         pub fn description(mut self, description: impl Into<String>) -> Self {
             self.0.description.replace(description.into());
             self
         }
 
+        #[must_use]
         pub fn sound(mut self, sound: impl Into<String>) -> Self {
             self.0.sound.replace(sound.into());
             self
         }
 
-        pub fn lights(mut self, lights: bool) -> Self {
+        #[must_use]
+        pub const fn lights(mut self, lights: bool) -> Self {
             self.0.lights = Some(lights);
             self
         }
 
+        #[must_use]
         pub fn light_color(mut self, color: impl Into<String>) -> Self {
             self.0.light_color.replace(color.into());
             self
         }
 
-        pub fn vibration(mut self, vibration: bool) -> Self {
+        #[must_use]
+        pub const fn vibration(mut self, vibration: bool) -> Self {
             self.0.vibration = Some(vibration);
             self
         }
 
-        pub fn importance(mut self, importance: Importance) -> Self {
+        #[must_use]
+        pub const fn importance(mut self, importance: Importance) -> Self {
             self.0.importance = Some(importance);
             self
         }
 
-        pub fn visibility(mut self, visibility: Visibility) -> Self {
+        #[must_use]
+        pub const fn visibility(mut self, visibility: Visibility) -> Self {
             self.0.visibility.replace(visibility);
             self
         }
 
+        #[must_use]
         pub fn build(self) -> Channel {
             self.0
         }
@@ -568,6 +775,23 @@ mod android {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_provider_uses_the_guest_spelling() {
+        for (provider, name) in [
+            (PushProvider::Auto, "auto"),
+            (PushProvider::Fcm, "fcm"),
+            (PushProvider::UnifiedPush, "unifiedpush"),
+            (PushProvider::Embedded, "embedded"),
+        ] {
+            assert_eq!(serde_json::to_value(provider).expect("serialize"), name);
+            assert_eq!(
+                serde_json::from_value::<PushProvider>(serde_json::json!(name)).expect("parse"),
+                provider
+            );
+        }
+        assert!(serde_json::from_value::<PushProvider>(serde_json::json!("apns")).is_err());
+    }
 
     #[test]
     fn test_attachment_creation() {
@@ -702,6 +926,17 @@ mod tests {
         assert!(data.inbox_lines.is_empty());
         assert!(data.attachments.is_empty());
         assert!(data.extra.is_empty());
+    }
+
+    #[test]
+    fn test_only_alert_once_uses_the_android_key() {
+        let data = NotificationData {
+            only_alert_once: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&data).expect("Failed to serialize notification data");
+        assert!(json.contains("\"onlyAlertOnce\":false"));
+        assert!(NotificationData::default().only_alert_once.is_none());
     }
 
     #[test]
