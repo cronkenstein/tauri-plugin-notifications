@@ -101,6 +101,8 @@ fn main() {
             swift_bridge_build::parse_bridges(bridges)
                 .write_all_concatenated(swift_bridge_out_dir(), env!("CARGO_PKG_NAME"));
 
+            make_bridge_functions_public(swift_bridge_out_dir());
+
             compile_swift();
 
             println!("cargo:rustc-link-lib=static=tauri-plugin-notifications");
@@ -114,10 +116,53 @@ fn main() {
     }
 }
 
+/// swift-bridge generates the `@_cdecl` bridge functions as `internal`.
+/// Swift release builds use whole-module optimization, which localizes
+/// internal functions ("non-external (was a private external)") in the
+/// merged product object. The linker cannot resolve the Rust crate's
+/// undefined references against localized symbols, so the final binary
+/// fails with `Undefined symbols for architecture arm64: ___swift_bridge__$...`.
+///
+/// Marking the bridge functions `public` makes them true external symbols
+/// that survive WMO. Their signatures only reference C types (from the
+/// bridging header) and stdlib types, so `public` is always legal here.
+/// The `__TypedThrowsCheck` helpers stay internal: nothing outside the
+/// module calls them, and their `FFIResult.Type` signatures have no
+/// reason to be exported.
+#[cfg(target_os = "macos")]
+fn make_bridge_functions_public(swift_bridge_out_dir: PathBuf) {
+    let crate_name = env!("CARGO_PKG_NAME");
+    let path = swift_bridge_out_dir
+        .join(&crate_name)
+        .join(format!("{crate_name}.swift"));
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut out = String::with_capacity(src.len());
+    let mut prev_line = String::new();
+    for line in src.lines() {
+        let follows_cdecl = prev_line.trim_start().starts_with("@_cdecl(");
+        let is_bridge_fn = line.starts_with("func __swift_bridge__")
+            && !line.contains("__TypedThrowsCheck");
+        if follows_cdecl && is_bridge_fn {
+            out.push_str("public ");
+        }
+        out.push_str(line);
+        out.push('\n');
+        prev_line = line.to_string();
+    }
+    std::fs::write(&path, out).expect("Failed to patch generated Swift bridge file");
+}
+
 #[cfg(target_os = "macos")]
 fn compile_swift() {
     let swift_package_dir = manifest_dir().join("macos");
     let target_triple = swift_target_triple();
+
+    // Wipe the SwiftPM scratch dir: leftover state from a different
+    // toolchain or engine confuses layout and freshness detection, which
+    // silently skips re-archiving the product.
+    std::fs::remove_dir_all(swift_build_dir()).ok();
 
     let mut cmd = Command::new("swift");
 
@@ -133,6 +178,14 @@ fn compile_swift() {
                 .to_str()
                 .expect("Swift build path must be valid UTF-8"),
         ])
+        // Linker note (Swift 6.4 / Xcode 27.1): every SwiftPM engine builds
+        // release with WMO, and WMO localizes internal @_cdecl swift-bridge
+        // symbols ("non-external (was a private external)"), which the
+        // linker cannot resolve against the Rust crate's undefined
+        // references. The bridge functions in
+        // Sources/generated/tauri-plugin-notifications/tauri-plugin-notifications.swift
+        // are therefore declared `public` so they compile to true external
+        // symbols that survive WMO. Do not simplify them back to internal.
         .args(["--triple", &target_triple])
         .args([
             "-Xswiftc",
